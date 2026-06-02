@@ -1,0 +1,12 @@
+{
+  "display_windows": [
+    "primary",
+    "secondary"
+  ],
+  "opacity": 0.9,
+  "position": null,
+  "show_api_cost_estimate": false,
+  "show_resets": false,
+  "show_token_counter": false,
+  "visibility_mode": "process"
+}
