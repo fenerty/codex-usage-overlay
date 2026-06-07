@@ -29,7 +29,7 @@ from typing import Any
 
 
 APP_NAME = "Codex Usage Overlay"
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.1.2"
 SETTINGS_FILE_NAME = "codex_usage_overlay.settings.json"
 RUNTIME_STATE_FILE_NAME = "codex-usage-overlay-state.json"
 INSTANCE_LOCK_FILE_NAME = "codex-usage-overlay.lock"
@@ -1510,8 +1510,7 @@ class OverlayApp:
         self.snapshot: RateSnapshot | None = None
         self.drag_offset: tuple[int, int] | None = None
         self.is_dragging = False
-        self.menu_open = False
-        self.render_pending = False
+        self.needs_render_after_drag = False
         self.force_rescan = True
 
         self.root = tk.Tk()
@@ -1530,7 +1529,6 @@ class OverlayApp:
         self.labels: list[tk.Label] = []
 
         self.menu = Menu(self.root, tearoff=False)
-        self.menu.bind("<Unmap>", self.on_menu_closed)
         self.visibility_var = tk.StringVar(value=self.settings["visibility_mode"])
         self.window_vars = {
             "primary": tk.BooleanVar(value="primary" in self.settings["display_windows"]),
@@ -1547,8 +1545,10 @@ class OverlayApp:
 
     def _bind_window_events(self, widget: tk.Widget) -> None:
         widget.bind("<ButtonPress-1>", self.start_drag)
-        widget.bind("<ButtonRelease-3>", self.show_menu)
-        widget.bind("<ButtonRelease-2>", self.show_menu)
+        widget.bind("<B1-Motion>", self.drag)
+        widget.bind("<ButtonRelease-1>", self.end_drag)
+        widget.bind("<Button-3>", self.show_menu)
+        widget.bind("<Button-2>", self.show_menu)
 
     def _position_window(self) -> None:
         original_position = self.settings.get("position")
@@ -1577,23 +1577,17 @@ class OverlayApp:
         )
 
     def start_drag(self, event: tk.Event) -> None:
-        if self.menu_open:
-            return
         self.is_dragging = True
         self.drag_offset = (event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y())
-        try:
-            self.root.grab_set()
-        except tk.TclError:
-            pass
-        self.root.bind_all("<B1-Motion>", self.drag)
-        self.root.bind_all("<ButtonRelease-1>", self.end_drag)
 
     def drag(self, event: tk.Event) -> None:
         if self.drag_offset is None or not self.is_dragging:
             return
         offset_x, offset_y = self.drag_offset
+        pointer_x = int(getattr(event, "x_root", self.root.winfo_pointerx()))
+        pointer_y = int(getattr(event, "y_root", self.root.winfo_pointery()))
         x, y = clamp_overlay_position(
-            [event.x_root - offset_x, event.y_root - offset_y],
+            [pointer_x - offset_x, pointer_y - offset_y],
             self.screen_bounds(),
             self.current_window_size(),
         )
@@ -1604,20 +1598,14 @@ class OverlayApp:
             return
         self.drag_offset = None
         self.is_dragging = False
-        self.root.unbind_all("<B1-Motion>")
-        self.root.unbind_all("<ButtonRelease-1>")
-        try:
-            if self.root.grab_current() is self.root:
-                self.root.grab_release()
-        except tk.TclError:
-            pass
         self.settings["position"] = clamp_overlay_position(
             [self.root.winfo_x(), self.root.winfo_y()],
             self.screen_bounds(),
             self.current_window_size(),
         )
         self.save_settings()
-        self.finish_deferred_render()
+        if self.needs_render_after_drag:
+            self.request_render(force=True)
 
     def run(self) -> None:
         try:
@@ -1654,15 +1642,11 @@ class OverlayApp:
         return estimate_api_cost(self.token_counter.totals, self.detected_model, self.counter_reset_model)
 
     def request_render(self, force: bool = False) -> None:
-        if not force and (self.is_dragging or self.menu_open):
-            self.render_pending = True
+        if not force and self.is_dragging:
+            self.needs_render_after_drag = True
             return
-        self.render_pending = False
+        self.needs_render_after_drag = False
         self.render()
-
-    def finish_deferred_render(self) -> None:
-        if self.render_pending and not self.is_dragging and not self.menu_open:
-            self.request_render(force=True)
 
     def render(self) -> None:
         for label in self.labels:
@@ -1746,18 +1730,11 @@ class OverlayApp:
     def show_menu(self, event: tk.Event) -> None:
         if self.is_dragging:
             return
-        self.menu_open = True
         self.rebuild_menu()
         try:
             self.menu.tk_popup(event.x_root, event.y_root)
         finally:
             self.menu.grab_release()
-
-    def on_menu_closed(self, _event: tk.Event | None = None) -> None:
-        if not self.menu_open:
-            return
-        self.menu_open = False
-        self.finish_deferred_render()
 
     def rebuild_menu(self) -> None:
         self.menu.delete(0, tk.END)
@@ -1803,24 +1780,24 @@ class OverlayApp:
             self.menu.add_checkbutton(
                 label=long_window_label(key, self.get_window(key)),
                 variable=self.window_vars[key],
-                command=lambda selected=key, enabled=key not in current_windows: self.set_display_window(
-                    selected, enabled
+                command=lambda selected=key: self.set_display_window(
+                    selected, bool(self.window_vars[selected].get())
                 ),
             )
         self.menu.add_checkbutton(
             label="Show Reset Countdown",
             variable=self.show_resets_var,
-            command=lambda enabled=not show_resets: self.set_show_resets(enabled),
+            command=lambda: self.set_show_resets(bool(self.show_resets_var.get())),
         )
         self.menu.add_checkbutton(
             label="Show Token Counter",
             variable=self.show_token_counter_var,
-            command=lambda enabled=not show_token_counter: self.set_show_token_counter(enabled),
+            command=lambda: self.set_show_token_counter(bool(self.show_token_counter_var.get())),
         )
         self.menu.add_checkbutton(
             label="Show API Cost Estimate",
             variable=self.show_api_cost_var,
-            command=lambda enabled=not show_api_cost_estimate: self.set_show_api_cost_estimate(enabled),
+            command=lambda: self.set_show_api_cost_estimate(bool(self.show_api_cost_var.get())),
         )
 
         if self.snapshot:

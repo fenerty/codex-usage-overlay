@@ -126,16 +126,16 @@ The app also clamps saved positions to the visible screen area on launch.
 
 ### Dragging or right-click menu feels unreliable
 
-The overlay captures mouse movement during drag and defers visual refreshes while
-dragging or using the menu. If behavior still feels odd, check for old processes
-and restart the app.
+Update to `0.1.2` or newer, then check for old processes and restart the app.
+The overlay prevents duplicate instances so overlapping windows do not fight for
+clicks.
 
 ```powershell
 Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*codex_usage_overlay.pyw*' }
 ```
 
-Only one instance should be running. New launches exit if another overlay
-instance is already active.
+Only one instance should be running. New launches exit cleanly if another
+overlay instance is already active.
 
 ## Development
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2 - 2026-06-07
+
+- Fix a 0.1.1 regression that could make dragging stop working.
+- Restore first-click right-click menu behavior for toggles and commands.
+- Keep the single-instance lock and visible-screen position clamp from 0.1.1.
+
 ## 0.1.1 - 2026-06-07
 
 - Improve dragging by capturing mouse movement for the full drag operation.
