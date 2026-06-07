@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1 - 2026-06-07
+
+- Improve dragging by capturing mouse movement for the full drag operation.
+- Defer visual refreshes while dragging or using the right-click menu.
+- Open the right-click menu on release and apply menu toggles from explicit states.
+- Clamp saved positions to the visible screen area to avoid off-screen launches.
+- Add a temp-file single-instance lock to avoid overlapping duplicate overlays.
+
 ## 0.1.0 - 2026-06-02
 
 - Initial public source release.

@@ -116,6 +116,27 @@ normal quit.
 - If models change during a manual token-counter window, reset the counter for a
   cleaner cost estimate.
 
+## Troubleshooting
+
+### I launched it but do not see it
+
+The overlay saves its last screen position in `codex_usage_overlay.settings.json`.
+If your monitor layout changed, delete the `position` value or set it to `null`.
+The app also clamps saved positions to the visible screen area on launch.
+
+### Dragging or right-click menu feels unreliable
+
+The overlay captures mouse movement during drag and defers visual refreshes while
+dragging or using the menu. If behavior still feels odd, check for old processes
+and restart the app.
+
+```powershell
+Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*codex_usage_overlay.pyw*' }
+```
+
+Only one instance should be running. New launches exit if another overlay
+instance is already active.
+
 ## Development
 
 Run the tests:

@@ -1,6 +1,7 @@
 import importlib.machinery
 import importlib.util
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -758,6 +759,61 @@ class RuntimeStateTests(unittest.TestCase):
             store.write(None, overlay.TokenCounter(reset_at=1_000))
 
             store.delete()
+
+            self.assertFalse(path.exists())
+
+
+class PositionTests(unittest.TestCase):
+    def test_saved_position_inside_bounds_is_preserved(self):
+        position = overlay.normalize_overlay_position([100, 200], (0, 0, 1920, 1080), (200, 50))
+
+        self.assertEqual(position, [100, 200])
+
+    def test_saved_position_outside_bounds_is_clamped_visible(self):
+        position = overlay.normalize_overlay_position([3913, 999], (0, 0, 1920, 1080), (200, 50))
+
+        self.assertEqual(position, [1720, 999])
+
+    def test_invalid_position_uses_default_visible_position(self):
+        position = overlay.normalize_overlay_position(None, (0, 0, 1920, 1080), (200, 50))
+
+        self.assertEqual(position, [1708, 72])
+
+    def test_negative_secondary_monitor_coordinates_are_supported(self):
+        inside = overlay.normalize_overlay_position([-1800, 100], (-1920, 0, 3840, 1080), (200, 50))
+        outside = overlay.normalize_overlay_position([-2500, -100], (-1920, 0, 3840, 1080), (200, 50))
+
+        self.assertEqual(inside, [-1800, 100])
+        self.assertEqual(outside, [-1920, 0])
+
+
+class SingleInstanceLockTests(unittest.TestCase):
+    def test_lock_blocks_second_live_instance(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "overlay.lock"
+            first = overlay.SingleInstanceLock(path=path, pid=os.getpid())
+            second = overlay.SingleInstanceLock(path=path, pid=123456)
+
+            self.assertTrue(first.acquire())
+            try:
+                self.assertFalse(second.acquire())
+            finally:
+                first.release()
+
+            self.assertFalse(path.exists())
+
+    def test_lock_replaces_stale_pid_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "overlay.lock"
+            path.write_text(json.dumps({"pid": 987654321}), encoding="utf-8")
+            lock = overlay.SingleInstanceLock(path=path, pid=123)
+
+            self.assertTrue(lock.acquire())
+            try:
+                state = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(state["pid"], 123)
+            finally:
+                lock.release()
 
             self.assertFalse(path.exists())
 

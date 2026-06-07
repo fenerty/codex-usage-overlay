@@ -29,9 +29,10 @@ from typing import Any
 
 
 APP_NAME = "Codex Usage Overlay"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 SETTINGS_FILE_NAME = "codex_usage_overlay.settings.json"
 RUNTIME_STATE_FILE_NAME = "codex-usage-overlay-state.json"
+INSTANCE_LOCK_FILE_NAME = "codex-usage-overlay.lock"
 DEFAULT_DISPLAY_WINDOWS = ("primary", "secondary")
 VALID_DISPLAY_WINDOWS = ("primary", "secondary")
 VALID_VISIBILITY_MODES = ("always", "process", "foreground", "visible_window")
@@ -39,6 +40,9 @@ CODEX_PROCESS_NAMES = {"codex.exe"}
 GENERIC_CODEX_PROCESS_NAMES = {"codex", "codex.exe"}
 DEFAULT_OPACITY = 0.9
 POLL_INTERVAL_MS = 500
+MIN_VISIBLE_PIXELS = 24
+DEFAULT_OVERLAY_WIDTH = 190
+DEFAULT_OVERLAY_HEIGHT = 40
 MAX_SESSION_FILES_TO_SCAN = 10
 TAIL_BYTES = 1_048_576
 RESET_PENDING_GRACE_SECONDS = 60
@@ -812,6 +816,89 @@ def normalize_visibility_mode(value: Any) -> str:
     return value if value in VALID_VISIBILITY_MODES else "process"
 
 
+def clamp_int(value: int, minimum: int, maximum: int) -> int:
+    if minimum > maximum:
+        return minimum
+    return max(minimum, min(maximum, value))
+
+
+def normalize_window_size(window_size: tuple[int, int] | None = None) -> tuple[int, int]:
+    if window_size is None:
+        return (DEFAULT_OVERLAY_WIDTH, DEFAULT_OVERLAY_HEIGHT)
+    width, height = window_size
+    return (max(1, int(width)), max(1, int(height)))
+
+
+def default_overlay_position(
+    bounds: tuple[int, int, int, int],
+    window_size: tuple[int, int] | None = None,
+) -> list[int]:
+    left, top, width, _height = bounds
+    window_width, _window_height = normalize_window_size(window_size)
+    x = left + max(0, width - window_width - 12)
+    y = top + 72
+    return clamp_overlay_position([x, y], bounds, window_size)
+
+
+def clamp_overlay_position(
+    position: list[int] | tuple[int, int],
+    bounds: tuple[int, int, int, int],
+    window_size: tuple[int, int] | None = None,
+) -> list[int]:
+    left, top, width, height = bounds
+    window_width, window_height = normalize_window_size(window_size)
+    if width <= 0 or height <= 0:
+        return [0, 0]
+
+    if window_width <= width:
+        min_x = left
+        max_x = left + width - window_width
+    else:
+        min_x = left - window_width + MIN_VISIBLE_PIXELS
+        max_x = left + width - MIN_VISIBLE_PIXELS
+
+    if window_height <= height:
+        min_y = top
+        max_y = top + height - window_height
+    else:
+        min_y = top - window_height + MIN_VISIBLE_PIXELS
+        max_y = top + height - MIN_VISIBLE_PIXELS
+
+    return [
+        clamp_int(int(position[0]), min_x, max_x),
+        clamp_int(int(position[1]), min_y, max_y),
+    ]
+
+
+def normalize_overlay_position(
+    value: Any,
+    bounds: tuple[int, int, int, int],
+    window_size: tuple[int, int] | None = None,
+) -> list[int]:
+    if (
+        isinstance(value, list)
+        and len(value) == 2
+        and all(isinstance(item, int) for item in value)
+    ):
+        return clamp_overlay_position(value, bounds, window_size)
+    return default_overlay_position(bounds, window_size)
+
+
+def windows_virtual_screen_bounds() -> tuple[int, int, int, int] | None:
+    if platform.system() != "Windows":
+        return None
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        return (
+            int(user32.GetSystemMetrics(76)),
+            int(user32.GetSystemMetrics(77)),
+            int(user32.GetSystemMetrics(78)),
+            int(user32.GetSystemMetrics(79)),
+        )
+    except (OSError, AttributeError):
+        return None
+
+
 def settings_path() -> Path:
     try:
         base = Path(__file__).resolve().parent
@@ -1084,6 +1171,10 @@ def runtime_state_path() -> Path:
     return Path(tempfile.gettempdir()) / RUNTIME_STATE_FILE_NAME
 
 
+def instance_lock_path() -> Path:
+    return Path(tempfile.gettempdir()) / INSTANCE_LOCK_FILE_NAME
+
+
 def process_exists(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -1103,6 +1194,61 @@ def process_exists(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+class SingleInstanceLock:
+    def __init__(self, path: Path | None = None, pid: int | None = None) -> None:
+        self.path = path or instance_lock_path()
+        self.pid = os.getpid() if pid is None else pid
+        self.acquired = False
+
+    def acquire(self) -> bool:
+        for _attempt in range(2):
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                if self._existing_process_is_alive():
+                    return False
+                self._delete_stale()
+                continue
+            except OSError:
+                return True
+
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"app": APP_NAME, "pid": self.pid, "created_at": time.time()}, handle)
+                handle.write("\n")
+            self.acquired = True
+            return True
+        return False
+
+    def release(self) -> None:
+        if not self.acquired:
+            return
+        try:
+            with self.path.open("r", encoding="utf-8") as handle:
+                state = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            state = {}
+        if parse_int(state.get("pid")) in {0, self.pid}:
+            self._delete_stale()
+        self.acquired = False
+
+    def _existing_process_is_alive(self) -> bool:
+        try:
+            with self.path.open("r", encoding="utf-8") as handle:
+                state = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return False
+        return process_exists(parse_int(state.get("pid")))
+
+    def _delete_stale(self) -> None:
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
 
 class RuntimeStateStore:
@@ -1363,6 +1509,9 @@ class OverlayApp:
         atexit.register(self.runtime_state.delete)
         self.snapshot: RateSnapshot | None = None
         self.drag_offset: tuple[int, int] | None = None
+        self.is_dragging = False
+        self.menu_open = False
+        self.render_pending = False
         self.force_rescan = True
 
         self.root = tk.Tk()
@@ -1381,6 +1530,7 @@ class OverlayApp:
         self.labels: list[tk.Label] = []
 
         self.menu = Menu(self.root, tearoff=False)
+        self.menu.bind("<Unmap>", self.on_menu_closed)
         self.visibility_var = tk.StringVar(value=self.settings["visibility_mode"])
         self.window_vars = {
             "primary": tk.BooleanVar(value="primary" in self.settings["display_windows"]),
@@ -1397,34 +1547,77 @@ class OverlayApp:
 
     def _bind_window_events(self, widget: tk.Widget) -> None:
         widget.bind("<ButtonPress-1>", self.start_drag)
-        widget.bind("<B1-Motion>", self.drag)
-        widget.bind("<ButtonRelease-1>", self.end_drag)
-        widget.bind("<Button-3>", self.show_menu)
-        widget.bind("<Button-2>", self.show_menu)
+        widget.bind("<ButtonRelease-3>", self.show_menu)
+        widget.bind("<ButtonRelease-2>", self.show_menu)
 
     def _position_window(self) -> None:
-        position = self.settings.get("position")
-        if position:
-            x, y = position
-        else:
-            self.root.update_idletasks()
-            x = max(0, self.root.winfo_screenwidth() - 190)
-            y = 72
+        original_position = self.settings.get("position")
+        position = normalize_overlay_position(
+            original_position,
+            self.screen_bounds(),
+            self.current_window_size(),
+        )
+        x, y = position
         self.root.geometry(f"+{x}+{y}")
+        if original_position is not None and original_position != position:
+            self.settings["position"] = position
+            self.save_settings()
+
+    def screen_bounds(self) -> tuple[int, int, int, int]:
+        bounds = windows_virtual_screen_bounds()
+        if bounds is not None:
+            return bounds
+        return (0, 0, int(self.root.winfo_screenwidth()), int(self.root.winfo_screenheight()))
+
+    def current_window_size(self) -> tuple[int, int]:
+        self.root.update_idletasks()
+        return (
+            max(DEFAULT_OVERLAY_WIDTH, int(self.root.winfo_width())),
+            max(DEFAULT_OVERLAY_HEIGHT, int(self.root.winfo_height())),
+        )
 
     def start_drag(self, event: tk.Event) -> None:
+        if self.menu_open:
+            return
+        self.is_dragging = True
         self.drag_offset = (event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y())
+        try:
+            self.root.grab_set()
+        except tk.TclError:
+            pass
+        self.root.bind_all("<B1-Motion>", self.drag)
+        self.root.bind_all("<ButtonRelease-1>", self.end_drag)
 
     def drag(self, event: tk.Event) -> None:
-        if self.drag_offset is None:
+        if self.drag_offset is None or not self.is_dragging:
             return
         offset_x, offset_y = self.drag_offset
-        self.root.geometry(f"+{event.x_root - offset_x}+{event.y_root - offset_y}")
+        x, y = clamp_overlay_position(
+            [event.x_root - offset_x, event.y_root - offset_y],
+            self.screen_bounds(),
+            self.current_window_size(),
+        )
+        self.root.geometry(f"+{x}+{y}")
 
     def end_drag(self, _event: tk.Event) -> None:
+        if not self.is_dragging:
+            return
         self.drag_offset = None
-        self.settings["position"] = [self.root.winfo_x(), self.root.winfo_y()]
+        self.is_dragging = False
+        self.root.unbind_all("<B1-Motion>")
+        self.root.unbind_all("<ButtonRelease-1>")
+        try:
+            if self.root.grab_current() is self.root:
+                self.root.grab_release()
+        except tk.TclError:
+            pass
+        self.settings["position"] = clamp_overlay_position(
+            [self.root.winfo_x(), self.root.winfo_y()],
+            self.screen_bounds(),
+            self.current_window_size(),
+        )
         self.save_settings()
+        self.finish_deferred_render()
 
     def run(self) -> None:
         try:
@@ -1440,7 +1633,7 @@ class OverlayApp:
             self.snapshot = batch.snapshot
         self.token_counter.add_events(batch.token_events)
 
-        self.render()
+        self.request_render()
         self.update_visibility()
         self.runtime_state.write(self.snapshot, self.token_counter, self.current_api_cost_estimate())
         if schedule_next:
@@ -1459,6 +1652,17 @@ class OverlayApp:
 
     def current_api_cost_estimate(self) -> ApiCostEstimate:
         return estimate_api_cost(self.token_counter.totals, self.detected_model, self.counter_reset_model)
+
+    def request_render(self, force: bool = False) -> None:
+        if not force and (self.is_dragging or self.menu_open):
+            self.render_pending = True
+            return
+        self.render_pending = False
+        self.render()
+
+    def finish_deferred_render(self) -> None:
+        if self.render_pending and not self.is_dragging and not self.menu_open:
+            self.request_render(force=True)
 
     def render(self) -> None:
         for label in self.labels:
@@ -1540,20 +1744,33 @@ class OverlayApp:
             self.root.withdraw()
 
     def show_menu(self, event: tk.Event) -> None:
+        if self.is_dragging:
+            return
+        self.menu_open = True
         self.rebuild_menu()
         try:
             self.menu.tk_popup(event.x_root, event.y_root)
         finally:
             self.menu.grab_release()
 
+    def on_menu_closed(self, _event: tk.Event | None = None) -> None:
+        if not self.menu_open:
+            return
+        self.menu_open = False
+        self.finish_deferred_render()
+
     def rebuild_menu(self) -> None:
         self.menu.delete(0, tk.END)
         self.visibility_var.set(self.settings["visibility_mode"])
+        current_windows = set(normalize_display_windows(self.settings.get("display_windows")))
         for key, variable in self.window_vars.items():
-            variable.set(key in self.settings["display_windows"])
-        self.show_resets_var.set(bool(self.settings.get("show_resets", False)))
-        self.show_token_counter_var.set(bool(self.settings.get("show_token_counter", False)))
-        self.show_api_cost_var.set(bool(self.settings.get("show_api_cost_estimate", False)))
+            variable.set(key in current_windows)
+        show_resets = bool(self.settings.get("show_resets", False))
+        show_token_counter = bool(self.settings.get("show_token_counter", False))
+        show_api_cost_estimate = bool(self.settings.get("show_api_cost_estimate", False))
+        self.show_resets_var.set(show_resets)
+        self.show_token_counter_var.set(show_token_counter)
+        self.show_api_cost_var.set(show_api_cost_estimate)
 
         self.menu.add_command(label=self.status_text(), state=tk.DISABLED)
         if self.snapshot and self.snapshot.plan_type:
@@ -1586,22 +1803,24 @@ class OverlayApp:
             self.menu.add_checkbutton(
                 label=long_window_label(key, self.get_window(key)),
                 variable=self.window_vars[key],
-                command=lambda selected=key: self.toggle_display_window(selected),
+                command=lambda selected=key, enabled=key not in current_windows: self.set_display_window(
+                    selected, enabled
+                ),
             )
         self.menu.add_checkbutton(
             label="Show Reset Countdown",
             variable=self.show_resets_var,
-            command=self.toggle_show_resets,
+            command=lambda enabled=not show_resets: self.set_show_resets(enabled),
         )
         self.menu.add_checkbutton(
             label="Show Token Counter",
             variable=self.show_token_counter_var,
-            command=self.toggle_show_token_counter,
+            command=lambda enabled=not show_token_counter: self.set_show_token_counter(enabled),
         )
         self.menu.add_checkbutton(
             label="Show API Cost Estimate",
             variable=self.show_api_cost_var,
-            command=self.toggle_show_api_cost_estimate,
+            command=lambda enabled=not show_api_cost_estimate: self.set_show_api_cost_estimate(enabled),
         )
 
         if self.snapshot:
@@ -1705,47 +1924,66 @@ class OverlayApp:
         self.save_settings()
         self.update_visibility()
 
-    def toggle_display_window(self, key: str) -> None:
+    def set_display_window(self, key: str, enabled: bool) -> None:
         current = set(normalize_display_windows(self.settings.get("display_windows")))
-        if key in current:
+        if enabled:
+            current.add(key)
+        elif key in current:
             if len(current) == 1:
                 self.window_vars[key].set(True)
                 return
             current.remove(key)
-        else:
-            current.add(key)
 
         ordered = [item for item in VALID_DISPLAY_WINDOWS if item in current]
         self.settings["display_windows"] = ordered
+        for item, variable in self.window_vars.items():
+            variable.set(item in ordered)
         self.save_settings()
-        self.render()
+        self.request_render()
+
+    def toggle_display_window(self, key: str) -> None:
+        current = set(normalize_display_windows(self.settings.get("display_windows")))
+        self.set_display_window(key, key not in current)
+
+    def set_show_resets(self, enabled: bool) -> None:
+        self.settings["show_resets"] = bool(enabled)
+        self.show_resets_var.set(bool(enabled))
+        self.save_settings()
+        self.request_render()
 
     def toggle_show_resets(self) -> None:
-        self.settings["show_resets"] = bool(self.show_resets_var.get())
+        self.set_show_resets(not bool(self.settings.get("show_resets", False)))
+
+    def set_show_token_counter(self, enabled: bool) -> None:
+        self.settings["show_token_counter"] = bool(enabled)
+        self.show_token_counter_var.set(bool(enabled))
         self.save_settings()
-        self.render()
+        self.request_render()
 
     def toggle_show_token_counter(self) -> None:
-        self.settings["show_token_counter"] = bool(self.show_token_counter_var.get())
+        self.set_show_token_counter(not bool(self.settings.get("show_token_counter", False)))
+
+    def set_show_api_cost_estimate(self, enabled: bool) -> None:
+        self.settings["show_api_cost_estimate"] = bool(enabled)
+        self.show_api_cost_var.set(bool(enabled))
         self.save_settings()
-        self.render()
+        self.request_render()
 
     def toggle_show_api_cost_estimate(self) -> None:
-        self.settings["show_api_cost_estimate"] = bool(self.show_api_cost_var.get())
-        self.save_settings()
-        self.render()
+        self.set_show_api_cost_estimate(not bool(self.settings.get("show_api_cost_estimate", False)))
 
     def reset_token_counter(self) -> None:
         self.refresh_detected_model(force=True)
         self.token_counter.reset()
         self.counter_reset_model = self.detected_model.model
         self.runtime_state.write(self.snapshot, self.token_counter, self.current_api_cost_estimate())
-        self.render()
+        self.request_render()
 
     def reset_position(self) -> None:
         self.settings["position"] = None
         self.save_settings()
         self._position_window()
+        self.request_render()
 
     def save_settings(self) -> None:
         save_settings(self.settings, self.settings_path)
@@ -1796,7 +2034,15 @@ def main() -> None:
         raise SystemExit(print_help())
     if "--print-status" in sys.argv:
         raise SystemExit(print_status())
-    OverlayApp().run()
+
+    instance_lock = SingleInstanceLock()
+    if not instance_lock.acquire():
+        return
+    atexit.register(instance_lock.release)
+    try:
+        OverlayApp().run()
+    finally:
+        instance_lock.release()
 
 
 if __name__ == "__main__":
