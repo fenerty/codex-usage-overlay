@@ -21,7 +21,7 @@ This is an independent utility and is not an official OpenAI or Codex project.
   total token details.
 - Optional API-equivalent cost estimate using local token counts and documented
   OpenAI API pricing constants.
-- Right-click menu for visibility modes, display toggles, refresh, reset
+- Right-click menu for visibility modes, display toggles, layout, refresh, reset
   position, token-counter reset, and status details.
 - No third-party packages, no network calls, and no `auth.json` access.
 
@@ -89,6 +89,7 @@ Supported settings include:
 
 - `visibility_mode`: `always`, `process`, `foreground`, or `visible_window`
 - `display_windows`: `primary`, `secondary`, or both
+- `layout_mode`: `horizontal`, `vertical`, or `grid_2x2`
 - `position`: saved overlay coordinates
 - `opacity`: `0.2` through `1.0`
 - `show_resets`: show reset countdowns

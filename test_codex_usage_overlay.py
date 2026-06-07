@@ -817,6 +817,25 @@ class SingleInstanceLockTests(unittest.TestCase):
 
             self.assertFalse(path.exists())
 
+    def test_lock_replaces_stale_heartbeat_even_if_pid_exists(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "overlay.lock"
+            state_path = Path(temp_dir) / "state.json"
+            path.write_text(json.dumps({"pid": 123, "created_at": 1}), encoding="utf-8")
+            state_path.write_text(json.dumps({"pid": 123, "last_update_at": 1}), encoding="utf-8")
+            lock = overlay.SingleInstanceLock(path=path, pid=456, state_path=state_path)
+            original_process_exists = overlay.process_exists
+            overlay.process_exists = lambda _pid: True
+            try:
+                self.assertTrue(lock.acquire())
+                state = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(state["pid"], 456)
+            finally:
+                overlay.process_exists = original_process_exists
+                lock.release()
+
+            self.assertFalse(path.exists())
+
 
 class DisplaySelectionTests(unittest.TestCase):
     def test_primary_only(self):
@@ -839,6 +858,47 @@ class DisplaySelectionTests(unittest.TestCase):
         self.assertFalse(settings["show_resets"])
         self.assertFalse(settings["show_token_counter"])
         self.assertFalse(settings["show_api_cost_estimate"])
+        self.assertEqual(settings["layout_mode"], "horizontal")
+
+    def test_invalid_layout_mode_defaults_to_horizontal(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "settings.json"
+            path.write_text(json.dumps({"layout_mode": "diagonal"}), encoding="utf-8")
+
+            settings = overlay.load_settings(path)
+
+        self.assertEqual(settings["layout_mode"], "horizontal")
+
+    def test_layout_positions(self):
+        self.assertEqual(
+            overlay.layout_positions(4, "horizontal"),
+            [(0, 0), (0, 1), (0, 2), (0, 3)],
+        )
+        self.assertEqual(
+            overlay.layout_positions(4, "vertical"),
+            [(0, 0), (1, 0), (2, 0), (3, 0)],
+        )
+        self.assertEqual(
+            overlay.layout_positions(4, "grid_2x2"),
+            [(0, 0), (0, 1), (1, 0), (1, 1)],
+        )
+
+    def test_display_widget_ordering(self):
+        settings = {
+            "display_windows": ["primary", "secondary"],
+            "show_token_counter": True,
+            "show_api_cost_estimate": True,
+        }
+
+        self.assertEqual(
+            overlay.active_display_widget_keys(settings),
+            ["primary", "secondary", "token_counter", "api_cost"],
+        )
+
+        settings["display_windows"] = ["secondary"]
+        settings["show_token_counter"] = False
+
+        self.assertEqual(overlay.active_display_widget_keys(settings), ["secondary", "api_cost"])
 
     def test_reset_countdown_formats_minutes_hours_and_days(self):
         now = 1_000

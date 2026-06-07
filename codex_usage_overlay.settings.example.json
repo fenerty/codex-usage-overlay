@@ -3,6 +3,7 @@
     "primary",
     "secondary"
   ],
+  "layout_mode": "horizontal",
   "opacity": 0.9,
   "position": null,
   "show_api_cost_estimate": false,

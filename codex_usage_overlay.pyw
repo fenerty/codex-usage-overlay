@@ -29,12 +29,14 @@ from typing import Any
 
 
 APP_NAME = "Codex Usage Overlay"
-APP_VERSION = "0.1.2"
+APP_VERSION = "0.1.3"
 SETTINGS_FILE_NAME = "codex_usage_overlay.settings.json"
 RUNTIME_STATE_FILE_NAME = "codex-usage-overlay-state.json"
 INSTANCE_LOCK_FILE_NAME = "codex-usage-overlay.lock"
 DEFAULT_DISPLAY_WINDOWS = ("primary", "secondary")
 VALID_DISPLAY_WINDOWS = ("primary", "secondary")
+DEFAULT_LAYOUT_MODE = "horizontal"
+VALID_LAYOUT_MODES = ("horizontal", "vertical", "grid_2x2")
 VALID_VISIBILITY_MODES = ("always", "process", "foreground", "visible_window")
 CODEX_PROCESS_NAMES = {"codex.exe"}
 GENERIC_CODEX_PROCESS_NAMES = {"codex", "codex.exe"}
@@ -43,6 +45,8 @@ POLL_INTERVAL_MS = 500
 MIN_VISIBLE_PIXELS = 24
 DEFAULT_OVERLAY_WIDTH = 190
 DEFAULT_OVERLAY_HEIGHT = 40
+INSTANCE_LOCK_STARTUP_GRACE_SECONDS = 10
+INSTANCE_LOCK_HEARTBEAT_STALE_SECONDS = 5
 MAX_SESSION_FILES_TO_SCAN = 10
 TAIL_BYTES = 1_048_576
 RESET_PENDING_GRACE_SECONDS = 60
@@ -137,6 +141,13 @@ class ApiCostEstimate:
     output_cost: float | None
     total_cost: float | None
     warning: str | None = None
+
+
+@dataclass(frozen=True)
+class DisplayWidget:
+    key: str
+    text: str
+    color: str
 
 
 @dataclass(frozen=True)
@@ -812,6 +823,40 @@ def normalize_display_windows(value: Any) -> list[str]:
     return list(dict.fromkeys(normalized))
 
 
+def normalize_layout_mode(value: Any) -> str:
+    return value if value in VALID_LAYOUT_MODES else DEFAULT_LAYOUT_MODE
+
+
+def active_display_widget_keys(settings: dict[str, Any]) -> list[str]:
+    keys = list(normalize_display_windows(settings.get("display_windows")))
+    if settings.get("show_token_counter", False):
+        keys.append("token_counter")
+    if settings.get("show_api_cost_estimate", False):
+        keys.append("api_cost")
+    return keys
+
+
+def layout_position(index: int, layout_mode: str) -> tuple[int, int]:
+    mode = normalize_layout_mode(layout_mode)
+    if mode == "vertical":
+        return (index, 0)
+    if mode == "grid_2x2":
+        return (index // 2, index % 2)
+    return (0, index)
+
+
+def layout_positions(count: int, layout_mode: str) -> list[tuple[int, int]]:
+    return [layout_position(index, layout_mode) for index in range(max(0, count))]
+
+
+def checked_menu_label(label: str, enabled: bool) -> str:
+    return f"[{'x' if enabled else ' '}] {label}"
+
+
+def selected_menu_label(label: str, selected: bool) -> str:
+    return f"({'*' if selected else ' '}) {label}"
+
+
 def normalize_visibility_mode(value: Any) -> str:
     return value if value in VALID_VISIBILITY_MODES else "process"
 
@@ -912,6 +957,7 @@ def load_settings(path: Path | None = None) -> dict[str, Any]:
     defaults = {
         "visibility_mode": "process",
         "display_windows": list(DEFAULT_DISPLAY_WINDOWS),
+        "layout_mode": DEFAULT_LAYOUT_MODE,
         "position": None,
         "opacity": DEFAULT_OPACITY,
         "show_resets": False,
@@ -931,6 +977,7 @@ def load_settings(path: Path | None = None) -> dict[str, Any]:
     settings = defaults | loaded
     settings["visibility_mode"] = normalize_visibility_mode(settings.get("visibility_mode"))
     settings["display_windows"] = normalize_display_windows(settings.get("display_windows"))
+    settings["layout_mode"] = normalize_layout_mode(settings.get("layout_mode"))
     try:
         settings["opacity"] = max(0.2, min(1.0, float(settings.get("opacity", DEFAULT_OPACITY))))
     except (TypeError, ValueError):
@@ -1197,9 +1244,15 @@ def process_exists(pid: int) -> bool:
 
 
 class SingleInstanceLock:
-    def __init__(self, path: Path | None = None, pid: int | None = None) -> None:
+    def __init__(
+        self,
+        path: Path | None = None,
+        pid: int | None = None,
+        state_path: Path | None = None,
+    ) -> None:
         self.path = path or instance_lock_path()
         self.pid = os.getpid() if pid is None else pid
+        self.state_path = state_path or runtime_state_path()
         self.acquired = False
 
     def acquire(self) -> bool:
@@ -1240,7 +1293,36 @@ class SingleInstanceLock:
                 state = json.load(handle)
         except (OSError, json.JSONDecodeError):
             return False
-        return process_exists(parse_int(state.get("pid")))
+        pid = parse_int(state.get("pid"))
+        if not process_exists(pid):
+            return False
+        if platform.system() != "Windows":
+            return True
+
+        now = time.time()
+        if self._runtime_state_is_fresh_for_pid(pid, now):
+            return True
+
+        try:
+            created_at = float(state.get("created_at", 0))
+        except (TypeError, ValueError):
+            created_at = 0
+        return created_at > 0 and now - created_at <= INSTANCE_LOCK_STARTUP_GRACE_SECONDS
+
+    def _runtime_state_is_fresh_for_pid(self, pid: int, now: float) -> bool:
+        try:
+            with self.state_path.open("r", encoding="utf-8") as handle:
+                state = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return False
+
+        if parse_int(state.get("pid")) != pid:
+            return False
+        try:
+            last_update_at = float(state.get("last_update_at", 0))
+        except (TypeError, ValueError):
+            return False
+        return last_update_at > 0 and now - last_update_at <= INSTANCE_LOCK_HEARTBEAT_STALE_SECONDS
 
     def _delete_stale(self) -> None:
         try:
@@ -1529,14 +1611,6 @@ class OverlayApp:
         self.labels: list[tk.Label] = []
 
         self.menu = Menu(self.root, tearoff=False)
-        self.visibility_var = tk.StringVar(value=self.settings["visibility_mode"])
-        self.window_vars = {
-            "primary": tk.BooleanVar(value="primary" in self.settings["display_windows"]),
-            "secondary": tk.BooleanVar(value="secondary" in self.settings["display_windows"]),
-        }
-        self.show_resets_var = tk.BooleanVar(value=bool(self.settings["show_resets"]))
-        self.show_token_counter_var = tk.BooleanVar(value=bool(self.settings["show_token_counter"]))
-        self.show_api_cost_var = tk.BooleanVar(value=bool(self.settings["show_api_cost_estimate"]))
 
         self._bind_window_events(self.root)
         self._bind_window_events(self.container)
@@ -1653,22 +1727,25 @@ class OverlayApp:
             label.destroy()
         self.labels.clear()
 
-        for text, color in self.display_segments():
+        widgets = self.display_widgets()
+        positions = layout_positions(len(widgets), self.settings.get("layout_mode", DEFAULT_LAYOUT_MODE))
+        for index, widget in enumerate(widgets):
             label = tk.Label(
                 self.container,
-                text=text,
-                fg=color,
+                text=widget.text,
+                fg=widget.color,
                 bg=COLOR_BG,
                 font=("Segoe UI", 10, "bold"),
-                padx=2,
-                pady=0,
+                padx=3,
+                pady=1,
             )
-            label.pack(side=tk.LEFT)
+            row, column = positions[index]
+            label.grid(row=row, column=column, sticky="w", padx=2, pady=1)
             self._bind_window_events(label)
             self.labels.append(label)
 
-    def display_segments(self) -> list[tuple[str, str]]:
-        segments: list[tuple[str, str]] = []
+    def display_widgets(self) -> list[DisplayWidget]:
+        widgets: list[DisplayWidget] = []
         selected = normalize_display_windows(self.settings.get("display_windows"))
         show_resets = bool(self.settings.get("show_resets", False))
         for key in selected:
@@ -1677,35 +1754,32 @@ class OverlayApp:
                 text = f"{default_window_label(key)} --"
                 if show_resets:
                     text += " reset --"
-                segments.append((text, COLOR_MUTED))
+                widgets.append(DisplayWidget(key, text, COLOR_MUTED))
             else:
-                segments.append(
-                    (
+                widgets.append(
+                    DisplayWidget(
+                        key,
                         self.format_window_text(rate_window, show_resets),
                         percent_color(rate_window.remaining_percent),
                     )
                 )
-            if key != selected[-1]:
-                segments.append(("  ", COLOR_TEXT))
 
         if self.snapshot and self.snapshot.rate_limit_reached_type:
-            if segments:
-                segments.append(("  ", COLOR_TEXT))
-            segments.append(("LIMIT", COLOR_RED))
+            if widgets:
+                first = widgets[0]
+                widgets[0] = DisplayWidget(first.key, f"{first.text} LIMIT", COLOR_RED)
+            else:
+                widgets.append(DisplayWidget("limit", "LIMIT", COLOR_RED))
 
         if self.settings.get("show_token_counter", False):
-            if segments:
-                segments.append(("  ", COLOR_TEXT))
-            segments.append((self.token_counter.display_text(), COLOR_TEXT))
+            widgets.append(DisplayWidget("token_counter", self.token_counter.display_text(), COLOR_TEXT))
 
         if self.settings.get("show_api_cost_estimate", False):
             estimate = self.current_api_cost_estimate()
-            if segments:
-                segments.append(("  ", COLOR_TEXT))
             color = COLOR_MUTED if estimate.total_cost is None else COLOR_TEXT
-            segments.append((format_api_cost_estimate(estimate), color))
+            widgets.append(DisplayWidget("api_cost", format_api_cost_estimate(estimate), color))
 
-        return segments or [("5h --  7d --", COLOR_MUTED)]
+        return widgets or [DisplayWidget("empty", "5h --  7d --", COLOR_MUTED)]
 
     def format_window_text(self, rate_window: RateWindow, show_resets: bool) -> str:
         text = f"{rate_window.label} {rate_window.remaining_percent}%"
@@ -1738,16 +1812,12 @@ class OverlayApp:
 
     def rebuild_menu(self) -> None:
         self.menu.delete(0, tk.END)
-        self.visibility_var.set(self.settings["visibility_mode"])
+        current_visibility = normalize_visibility_mode(self.settings.get("visibility_mode"))
         current_windows = set(normalize_display_windows(self.settings.get("display_windows")))
-        for key, variable in self.window_vars.items():
-            variable.set(key in current_windows)
         show_resets = bool(self.settings.get("show_resets", False))
         show_token_counter = bool(self.settings.get("show_token_counter", False))
         show_api_cost_estimate = bool(self.settings.get("show_api_cost_estimate", False))
-        self.show_resets_var.set(show_resets)
-        self.show_token_counter_var.set(show_token_counter)
-        self.show_api_cost_var.set(show_api_cost_estimate)
+        current_layout = normalize_layout_mode(self.settings.get("layout_mode"))
 
         self.menu.add_command(label=self.status_text(), state=tk.DISABLED)
         if self.snapshot and self.snapshot.plan_type:
@@ -1766,10 +1836,8 @@ class OverlayApp:
         for label, mode in visibility_items:
             supported = self.process_backend.is_supported(mode)
             item_label = label if supported else f"{label} (Windows only)"
-            self.menu.add_radiobutton(
-                label=item_label,
-                variable=self.visibility_var,
-                value=mode,
+            self.menu.add_command(
+                label=selected_menu_label(item_label, current_visibility == mode),
                 command=lambda selected=mode: self.set_visibility_mode(selected),
                 state=tk.NORMAL if supported else tk.DISABLED,
             )
@@ -1777,28 +1845,35 @@ class OverlayApp:
         self.menu.add_separator()
         self.menu.add_command(label="Rate Windows", state=tk.DISABLED)
         for key in VALID_DISPLAY_WINDOWS:
-            self.menu.add_checkbutton(
-                label=long_window_label(key, self.get_window(key)),
-                variable=self.window_vars[key],
-                command=lambda selected=key: self.set_display_window(
-                    selected, bool(self.window_vars[selected].get())
-                ),
+            self.menu.add_command(
+                label=checked_menu_label(long_window_label(key, self.get_window(key)), key in current_windows),
+                command=lambda selected=key: self.toggle_display_window(selected),
             )
-        self.menu.add_checkbutton(
-            label="Show Reset Countdown",
-            variable=self.show_resets_var,
-            command=lambda: self.set_show_resets(bool(self.show_resets_var.get())),
+        self.menu.add_command(
+            label=checked_menu_label("Show Reset Countdown", show_resets),
+            command=self.toggle_show_resets,
         )
-        self.menu.add_checkbutton(
-            label="Show Token Counter",
-            variable=self.show_token_counter_var,
-            command=lambda: self.set_show_token_counter(bool(self.show_token_counter_var.get())),
+        self.menu.add_command(
+            label=checked_menu_label("Show Token Counter", show_token_counter),
+            command=self.toggle_show_token_counter,
         )
-        self.menu.add_checkbutton(
-            label="Show API Cost Estimate",
-            variable=self.show_api_cost_var,
-            command=lambda: self.set_show_api_cost_estimate(bool(self.show_api_cost_var.get())),
+        self.menu.add_command(
+            label=checked_menu_label("Show API Cost Estimate", show_api_cost_estimate),
+            command=self.toggle_show_api_cost_estimate,
         )
+
+        self.menu.add_separator()
+        self.menu.add_command(label="Layout", state=tk.DISABLED)
+        layout_items = [
+            ("Horizontal", "horizontal"),
+            ("Vertical", "vertical"),
+            ("2x2 Grid", "grid_2x2"),
+        ]
+        for label, mode in layout_items:
+            self.menu.add_command(
+                label=selected_menu_label(label, current_layout == mode),
+                command=lambda selected=mode: self.set_layout_mode(selected),
+            )
 
         if self.snapshot:
             self.menu.add_separator()
@@ -1907,14 +1982,11 @@ class OverlayApp:
             current.add(key)
         elif key in current:
             if len(current) == 1:
-                self.window_vars[key].set(True)
                 return
             current.remove(key)
 
         ordered = [item for item in VALID_DISPLAY_WINDOWS if item in current]
         self.settings["display_windows"] = ordered
-        for item, variable in self.window_vars.items():
-            variable.set(item in ordered)
         self.save_settings()
         self.request_render()
 
@@ -1924,7 +1996,6 @@ class OverlayApp:
 
     def set_show_resets(self, enabled: bool) -> None:
         self.settings["show_resets"] = bool(enabled)
-        self.show_resets_var.set(bool(enabled))
         self.save_settings()
         self.request_render()
 
@@ -1933,7 +2004,6 @@ class OverlayApp:
 
     def set_show_token_counter(self, enabled: bool) -> None:
         self.settings["show_token_counter"] = bool(enabled)
-        self.show_token_counter_var.set(bool(enabled))
         self.save_settings()
         self.request_render()
 
@@ -1942,12 +2012,16 @@ class OverlayApp:
 
     def set_show_api_cost_estimate(self, enabled: bool) -> None:
         self.settings["show_api_cost_estimate"] = bool(enabled)
-        self.show_api_cost_var.set(bool(enabled))
         self.save_settings()
         self.request_render()
 
     def toggle_show_api_cost_estimate(self) -> None:
         self.set_show_api_cost_estimate(not bool(self.settings.get("show_api_cost_estimate", False)))
+
+    def set_layout_mode(self, mode: str) -> None:
+        self.settings["layout_mode"] = normalize_layout_mode(mode)
+        self.save_settings()
+        self.request_render()
 
     def reset_token_counter(self) -> None:
         self.refresh_detected_model(force=True)

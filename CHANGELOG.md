@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.3 - 2026-06-07
+
+- Replace Tk menu checkbuttons/radiobuttons with plain command items to fix delayed toggles.
+- Add horizontal, vertical, and 2x2 overlay layout modes.
+- Render rate windows, token counter, and API estimate as grid-positioned widgets.
+
 ## 0.1.2 - 2026-06-07
 
 - Fix a 0.1.1 regression that could make dragging stop working.
