@@ -127,7 +127,7 @@ The app also clamps saved positions to the visible screen area on launch.
 
 ### Dragging or right-click menu feels unreliable
 
-Update to `0.1.2` or newer, then check for old processes and restart the app.
+Update to `0.1.4` or newer, then check for old processes and restart the app.
 The overlay prevents duplicate instances so overlapping windows do not fight for
 clicks.
 

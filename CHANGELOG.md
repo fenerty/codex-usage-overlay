@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.4 - 2026-06-07
+
+- Prevent the overlay refresh loop from raising the overlay over the context menu.
+- Defer rendering and topmost refreshes while the right-click menu is open.
+
 ## 0.1.3 - 2026-06-07
 
 - Replace Tk menu checkbuttons/radiobuttons with plain command items to fix delayed toggles.

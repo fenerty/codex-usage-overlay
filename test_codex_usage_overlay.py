@@ -837,6 +837,76 @@ class SingleInstanceLockTests(unittest.TestCase):
             self.assertFalse(path.exists())
 
 
+class FakeRoot:
+    def __init__(self):
+        self.attribute_calls = []
+        self.deiconified = False
+        self.withdrawn = False
+
+    def attributes(self, *args):
+        self.attribute_calls.append(args)
+
+    def deiconify(self):
+        self.deiconified = True
+
+    def withdraw(self):
+        self.withdrawn = True
+
+    def after_idle(self, callback):
+        callback()
+
+
+class FakeProcessBackend:
+    def __init__(self, should_show=True):
+        self.should_show_result = should_show
+
+    def should_show(self, _mode):
+        return self.should_show_result
+
+
+class MenuInteractionTests(unittest.TestCase):
+    def make_app(self):
+        app = object.__new__(overlay.OverlayApp)
+        app.root = FakeRoot()
+        app.settings = {"visibility_mode": "always"}
+        app.process_backend = FakeProcessBackend()
+        app.menu_active = True
+        app.is_dragging = False
+        app.needs_render_after_menu = False
+        app.needs_render_after_drag = False
+        app.needs_visibility_after_menu = False
+        app.render_calls = 0
+        app.render = lambda: setattr(app, "render_calls", app.render_calls + 1)
+        return app
+
+    def test_render_defers_while_menu_active(self):
+        app = self.make_app()
+
+        overlay.OverlayApp.request_render(app)
+
+        self.assertTrue(app.needs_render_after_menu)
+        self.assertEqual(app.render_calls, 0)
+
+    def test_visibility_does_not_reassert_topmost_while_menu_active(self):
+        app = self.make_app()
+
+        overlay.OverlayApp.update_visibility(app)
+
+        self.assertTrue(app.needs_visibility_after_menu)
+        self.assertEqual(app.root.attribute_calls, [])
+
+    def test_menu_command_finishes_deferred_render_and_topmost(self):
+        app = self.make_app()
+
+        overlay.OverlayApp.run_menu_command(app, lambda: overlay.OverlayApp.request_render(app))
+
+        self.assertFalse(app.menu_active)
+        self.assertFalse(app.needs_render_after_menu)
+        self.assertEqual(app.render_calls, 1)
+        self.assertTrue(app.root.deiconified)
+        self.assertIn(("-topmost", True), app.root.attribute_calls)
+
+
 class DisplaySelectionTests(unittest.TestCase):
     def test_primary_only(self):
         self.assertEqual(overlay.normalize_display_windows(["primary"]), ["primary"])

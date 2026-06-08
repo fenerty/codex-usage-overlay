@@ -25,11 +25,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import Menu
-from typing import Any
+from typing import Any, Callable
 
 
 APP_NAME = "Codex Usage Overlay"
-APP_VERSION = "0.1.3"
+APP_VERSION = "0.1.4"
 SETTINGS_FILE_NAME = "codex_usage_overlay.settings.json"
 RUNTIME_STATE_FILE_NAME = "codex-usage-overlay-state.json"
 INSTANCE_LOCK_FILE_NAME = "codex-usage-overlay.lock"
@@ -42,6 +42,8 @@ CODEX_PROCESS_NAMES = {"codex.exe"}
 GENERIC_CODEX_PROCESS_NAMES = {"codex", "codex.exe"}
 DEFAULT_OPACITY = 0.9
 POLL_INTERVAL_MS = 500
+MENU_CLOSE_POLL_MS = 100
+MENU_UNOBSERVED_FALLBACK_SECONDS = 30
 MIN_VISIBLE_PIXELS = 24
 DEFAULT_OVERLAY_WIDTH = 190
 DEFAULT_OVERLAY_HEIGHT = 40
@@ -1230,11 +1232,30 @@ def process_exists(pid: int) -> bool:
     if platform.system() == "Windows":
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32.OpenProcess.argtypes = [
+            ctypes.wintypes.DWORD,
+            ctypes.wintypes.BOOL,
+            ctypes.wintypes.DWORD,
+        ]
+        kernel32.OpenProcess.restype = ctypes.wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [
+            ctypes.wintypes.HANDLE,
+            ctypes.POINTER(ctypes.wintypes.DWORD),
+        ]
+        kernel32.GetExitCodeProcess.restype = ctypes.wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+        kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
         handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
             return False
-        kernel32.CloseHandle(handle)
-        return True
+        try:
+            exit_code = ctypes.wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return int(exit_code.value) == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
 
     try:
         os.kill(pid, 0)
@@ -1592,7 +1613,12 @@ class OverlayApp:
         self.snapshot: RateSnapshot | None = None
         self.drag_offset: tuple[int, int] | None = None
         self.is_dragging = False
+        self.menu_active = False
+        self.menu_opened_at = 0.0
+        self.menu_observed_mapped = False
         self.needs_render_after_drag = False
+        self.needs_render_after_menu = False
+        self.needs_visibility_after_menu = False
         self.force_rescan = True
 
         self.root = tk.Tk()
@@ -1611,6 +1637,7 @@ class OverlayApp:
         self.labels: list[tk.Label] = []
 
         self.menu = Menu(self.root, tearoff=False)
+        self.menu.bind("<Unmap>", self.on_menu_unmapped)
 
         self._bind_window_events(self.root)
         self._bind_window_events(self.container)
@@ -1651,6 +1678,8 @@ class OverlayApp:
         )
 
     def start_drag(self, event: tk.Event) -> None:
+        if self.menu_active:
+            return
         self.is_dragging = True
         self.drag_offset = (event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y())
 
@@ -1716,9 +1745,13 @@ class OverlayApp:
         return estimate_api_cost(self.token_counter.totals, self.detected_model, self.counter_reset_model)
 
     def request_render(self, force: bool = False) -> None:
+        if not force and self.menu_active:
+            self.needs_render_after_menu = True
+            return
         if not force and self.is_dragging:
             self.needs_render_after_drag = True
             return
+        self.needs_render_after_menu = False
         self.needs_render_after_drag = False
         self.render()
 
@@ -1792,7 +1825,11 @@ class OverlayApp:
             return None
         return self.snapshot.primary if key == "primary" else self.snapshot.secondary
 
-    def update_visibility(self) -> None:
+    def update_visibility(self, force: bool = False) -> None:
+        if not force and self.menu_active:
+            self.needs_visibility_after_menu = True
+            return
+        self.needs_visibility_after_menu = False
         mode = self.settings.get("visibility_mode", "process")
         should_show = self.process_backend.should_show(mode)
         if should_show:
@@ -1804,11 +1841,76 @@ class OverlayApp:
     def show_menu(self, event: tk.Event) -> None:
         if self.is_dragging:
             return
+        self.begin_menu_interaction()
         self.rebuild_menu()
         try:
             self.menu.tk_popup(event.x_root, event.y_root)
         finally:
             self.menu.grab_release()
+        self.schedule_menu_close_poll()
+
+    def begin_menu_interaction(self) -> None:
+        self.menu_active = True
+        self.menu_opened_at = time.time()
+        self.menu_observed_mapped = False
+        self.needs_render_after_menu = False
+        self.needs_visibility_after_menu = False
+        try:
+            self.root.attributes("-topmost", False)
+        except tk.TclError:
+            pass
+
+    def schedule_menu_close_poll(self) -> None:
+        try:
+            self.root.after(MENU_CLOSE_POLL_MS, self.poll_menu_closed)
+        except tk.TclError:
+            pass
+
+    def poll_menu_closed(self) -> None:
+        if not self.menu_active:
+            return
+        try:
+            menu_is_mapped = bool(self.menu.winfo_ismapped())
+        except tk.TclError:
+            menu_is_mapped = False
+        if menu_is_mapped:
+            self.menu_observed_mapped = True
+            self.schedule_menu_close_poll()
+        elif self.menu_observed_mapped:
+            self.finish_menu_interaction()
+        elif time.time() - self.menu_opened_at < MENU_UNOBSERVED_FALLBACK_SECONDS:
+            self.schedule_menu_close_poll()
+        else:
+            self.finish_menu_interaction()
+
+    def on_menu_unmapped(self, _event: tk.Event | None = None) -> None:
+        if not self.menu_active:
+            return
+        try:
+            self.root.after_idle(self.finish_menu_interaction)
+        except tk.TclError:
+            pass
+
+    def finish_menu_interaction(self) -> None:
+        if not self.menu_active:
+            return
+        self.menu_active = False
+        self.menu_opened_at = 0.0
+        self.menu_observed_mapped = False
+        if self.needs_render_after_menu:
+            self.request_render(force=True)
+        else:
+            self.needs_render_after_menu = False
+        self.update_visibility(force=True)
+
+    def run_menu_command(self, action: Callable[[], None]) -> None:
+        try:
+            action()
+        finally:
+            try:
+                self.root.after_idle(self.finish_menu_interaction)
+            except tk.TclError:
+                pass
 
     def rebuild_menu(self) -> None:
         self.menu.delete(0, tk.END)
@@ -1838,7 +1940,7 @@ class OverlayApp:
             item_label = label if supported else f"{label} (Windows only)"
             self.menu.add_command(
                 label=selected_menu_label(item_label, current_visibility == mode),
-                command=lambda selected=mode: self.set_visibility_mode(selected),
+                command=lambda selected=mode: self.run_menu_command(lambda: self.set_visibility_mode(selected)),
                 state=tk.NORMAL if supported else tk.DISABLED,
             )
 
@@ -1847,19 +1949,19 @@ class OverlayApp:
         for key in VALID_DISPLAY_WINDOWS:
             self.menu.add_command(
                 label=checked_menu_label(long_window_label(key, self.get_window(key)), key in current_windows),
-                command=lambda selected=key: self.toggle_display_window(selected),
+                command=lambda selected=key: self.run_menu_command(lambda: self.toggle_display_window(selected)),
             )
         self.menu.add_command(
             label=checked_menu_label("Show Reset Countdown", show_resets),
-            command=self.toggle_show_resets,
+            command=lambda: self.run_menu_command(self.toggle_show_resets),
         )
         self.menu.add_command(
             label=checked_menu_label("Show Token Counter", show_token_counter),
-            command=self.toggle_show_token_counter,
+            command=lambda: self.run_menu_command(self.toggle_show_token_counter),
         )
         self.menu.add_command(
             label=checked_menu_label("Show API Cost Estimate", show_api_cost_estimate),
-            command=self.toggle_show_api_cost_estimate,
+            command=lambda: self.run_menu_command(self.toggle_show_api_cost_estimate),
         )
 
         self.menu.add_separator()
@@ -1872,7 +1974,7 @@ class OverlayApp:
         for label, mode in layout_items:
             self.menu.add_command(
                 label=selected_menu_label(label, current_layout == mode),
-                command=lambda selected=mode: self.set_layout_mode(selected),
+                command=lambda selected=mode: self.run_menu_command(lambda: self.set_layout_mode(selected)),
             )
 
         if self.snapshot:
@@ -1903,14 +2005,14 @@ class OverlayApp:
             state=tk.DISABLED,
         )
         self.menu.add_command(label=f"Reset {format_snapshot_time(datetime.fromtimestamp(self.token_counter.reset_at, timezone.utc).isoformat())}", state=tk.DISABLED)
-        self.menu.add_command(label="Reset Token Counter", command=self.reset_token_counter)
+        self.menu.add_command(label="Reset Token Counter", command=lambda: self.run_menu_command(self.reset_token_counter))
 
         self.add_api_estimate_menu_items()
 
         self.menu.add_separator()
-        self.menu.add_command(label="Refresh", command=self.manual_refresh)
-        self.menu.add_command(label="Reset position", command=self.reset_position)
-        self.menu.add_command(label="Quit", command=self.quit)
+        self.menu.add_command(label="Refresh", command=lambda: self.run_menu_command(self.manual_refresh))
+        self.menu.add_command(label="Reset position", command=lambda: self.run_menu_command(self.reset_position))
+        self.menu.add_command(label="Quit", command=lambda: self.run_menu_command(self.quit))
 
     def add_api_estimate_menu_items(self) -> None:
         estimate = self.current_api_cost_estimate()
