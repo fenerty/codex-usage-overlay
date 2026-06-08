@@ -863,6 +863,9 @@ class FakeProcessBackend:
     def should_show(self, _mode):
         return self.should_show_result
 
+    def is_supported(self, _mode):
+        return True
+
 
 class MenuInteractionTests(unittest.TestCase):
     def make_app(self):
@@ -871,6 +874,7 @@ class MenuInteractionTests(unittest.TestCase):
         app.settings = {"visibility_mode": "always"}
         app.process_backend = FakeProcessBackend()
         app.menu_active = True
+        app.menu_window = None
         app.is_dragging = False
         app.needs_render_after_menu = False
         app.needs_render_after_drag = False
@@ -905,6 +909,81 @@ class MenuInteractionTests(unittest.TestCase):
         self.assertEqual(app.render_calls, 1)
         self.assertTrue(app.root.deiconified)
         self.assertIn(("-topmost", True), app.root.attribute_calls)
+
+
+class MenuRowTests(unittest.TestCase):
+    def test_clickable_row_calls_command_exactly_once(self):
+        calls = []
+        row = overlay.MenuRow.command("Do thing", lambda: calls.append("called"))
+
+        self.assertTrue(row.invoke())
+
+        self.assertEqual(calls, ["called"])
+
+    def test_disabled_row_does_not_call_command(self):
+        calls = []
+        row = overlay.MenuRow("disabled", "Do not call", lambda: calls.append("called"))
+
+        self.assertFalse(row.invoke())
+
+        self.assertEqual(calls, [])
+
+
+class MenuModelTests(unittest.TestCase):
+    def make_app(self, **settings):
+        app = object.__new__(overlay.OverlayApp)
+        app.settings = {
+            "visibility_mode": "always",
+            "display_windows": ["primary", "secondary"],
+            "show_resets": False,
+            "show_token_counter": True,
+            "show_api_cost_estimate": False,
+            "layout_mode": "grid_2x2",
+        }
+        app.settings.update(settings)
+        app.reader = type("Reader", (), {"last_error": None})()
+        app.process_backend = FakeProcessBackend()
+        app.snapshot = None
+        app.token_counter = overlay.TokenCounter(reset_at=1_000)
+        app.detected_model = overlay.DetectedModel(None, "test")
+        app.counter_reset_model = None
+        app.menu_active = True
+        app.menu_window = None
+        app.needs_render_after_menu = False
+        app.needs_render_after_drag = False
+        app.needs_visibility_after_menu = False
+        app.is_dragging = False
+        app.root = FakeRoot()
+        app.render_calls = 0
+        app.save_calls = 0
+        app.render = lambda: setattr(app, "render_calls", app.render_calls + 1)
+        app.save_settings = lambda: setattr(app, "save_calls", app.save_calls + 1)
+        return app
+
+    def labels(self, app):
+        return [row.label for row in overlay.OverlayApp.build_menu_rows(app) if row.label]
+
+    def test_menu_item_labels_reflect_current_settings(self):
+        app = self.make_app()
+
+        labels = self.labels(app)
+
+        self.assertIn("(*) Always", labels)
+        self.assertIn("[x] Show Token Counter", labels)
+        self.assertIn("[ ] Show API Cost Estimate", labels)
+        self.assertIn("(*) 2x2 Grid", labels)
+
+    def test_layout_command_changes_mode_on_first_invocation(self):
+        app = self.make_app(layout_mode="horizontal")
+        rows = overlay.OverlayApp.build_menu_rows(app)
+        grid_row = next(row for row in rows if row.label == "( ) 2x2 Grid")
+
+        self.assertTrue(grid_row.invoke())
+
+        self.assertEqual(app.settings["layout_mode"], "grid_2x2")
+        self.assertEqual(app.save_calls, 1)
+        self.assertEqual(app.render_calls, 1)
+        self.assertFalse(app.menu_active)
 
 
 class DisplaySelectionTests(unittest.TestCase):

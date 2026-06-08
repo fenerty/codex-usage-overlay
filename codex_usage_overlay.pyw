@@ -24,12 +24,11 @@ import tkinter as tk
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from tkinter import Menu
 from typing import Any, Callable
 
 
 APP_NAME = "Codex Usage Overlay"
-APP_VERSION = "0.1.4"
+APP_VERSION = "0.1.5"
 SETTINGS_FILE_NAME = "codex_usage_overlay.settings.json"
 RUNTIME_STATE_FILE_NAME = "codex-usage-overlay-state.json"
 INSTANCE_LOCK_FILE_NAME = "codex-usage-overlay.lock"
@@ -42,8 +41,6 @@ CODEX_PROCESS_NAMES = {"codex.exe"}
 GENERIC_CODEX_PROCESS_NAMES = {"codex", "codex.exe"}
 DEFAULT_OPACITY = 0.9
 POLL_INTERVAL_MS = 500
-MENU_CLOSE_POLL_MS = 100
-MENU_UNOBSERVED_FALLBACK_SECONDS = 30
 MIN_VISIBLE_PIXELS = 24
 DEFAULT_OVERLAY_WIDTH = 190
 DEFAULT_OVERLAY_HEIGHT = 40
@@ -73,6 +70,13 @@ COLOR_MUTED = "#8b949e"
 COLOR_GREEN = "#4ade80"
 COLOR_AMBER = "#fbbf24"
 COLOR_RED = "#fb7185"
+MENU_BG = "#f8fafc"
+MENU_BORDER = "#9ca3af"
+MENU_TEXT = "#111827"
+MENU_MUTED = "#6b7280"
+MENU_HOVER = "#dbeafe"
+MENU_DISABLED_BG = "#f8fafc"
+MENU_SEPARATOR = "#d1d5db"
 
 MODEL_ASSIGNMENT_RE = re.compile(r'(?:^|[\s{,])model=(?:"([^"]+)"|([^\s},]+))', re.IGNORECASE)
 CONFIG_MODEL_RE = re.compile(r'^\s*model\s*=\s*"([^"]+)"\s*$', re.IGNORECASE | re.MULTILINE)
@@ -150,6 +154,37 @@ class DisplayWidget:
     key: str
     text: str
     color: str
+
+
+@dataclass(frozen=True)
+class MenuRow:
+    kind: str
+    label: str = ""
+    action: Callable[[], None] | None = None
+
+    @classmethod
+    def command(cls, label: str, action: Callable[[], None], enabled: bool = True) -> "MenuRow":
+        if enabled:
+            return cls("command", label, action)
+        return cls("disabled", label)
+
+    @classmethod
+    def disabled(cls, label: str) -> "MenuRow":
+        return cls("disabled", label)
+
+    @classmethod
+    def separator(cls) -> "MenuRow":
+        return cls("separator")
+
+    @property
+    def clickable(self) -> bool:
+        return self.kind == "command" and self.action is not None
+
+    def invoke(self) -> bool:
+        if not self.clickable or self.action is None:
+            return False
+        self.action()
+        return True
 
 
 @dataclass(frozen=True)
@@ -917,6 +952,23 @@ def clamp_overlay_position(
     ]
 
 
+def clamp_popup_position(
+    position: list[int] | tuple[int, int],
+    bounds: tuple[int, int, int, int],
+    window_size: tuple[int, int],
+) -> list[int]:
+    left, top, width, height = bounds
+    window_width, window_height = normalize_window_size(window_size)
+    if width <= 0 or height <= 0:
+        return [0, 0]
+    max_x = left + max(0, width - window_width)
+    max_y = top + max(0, height - window_height)
+    return [
+        clamp_int(int(position[0]), left, max_x),
+        clamp_int(int(position[1]), top, max_y),
+    ]
+
+
 def normalize_overlay_position(
     value: Any,
     bounds: tuple[int, int, int, int],
@@ -1597,6 +1649,143 @@ def windows_has_visible_codex_window() -> bool:
     return matches["found"]
 
 
+class ContextMenuWindow:
+    def __init__(self, app: "OverlayApp", rows: list[MenuRow]) -> None:
+        self.app = app
+        self.rows = rows
+        self.window = tk.Toplevel(app.root)
+        self.window.withdraw()
+        self.window.overrideredirect(True)
+        self.window.configure(bg=MENU_BORDER)
+        self.window.transient(app.root)
+        self.window.bind("<Escape>", self._dismiss)
+        self.window.bind("<FocusOut>", self._schedule_focus_dismiss)
+        self.window.bind("<Button-1>", self._dismiss_if_outside, add="+")
+        self.window.bind("<Button-3>", self._dismiss_if_outside, add="+")
+        try:
+            self.window.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+
+        self.frame = tk.Frame(self.window, bg=MENU_BG, padx=0, pady=4)
+        self.frame.pack(padx=1, pady=1)
+        self.closed = False
+        self.focus_dismiss_enabled = False
+        self._render_rows()
+
+    def _render_rows(self) -> None:
+        for row in self.rows:
+            if row.kind == "separator":
+                separator = tk.Frame(self.frame, bg=MENU_SEPARATOR, height=1)
+                separator.pack(fill="x", padx=8, pady=4)
+                continue
+
+            fg = MENU_TEXT if row.clickable else MENU_MUTED
+            label = tk.Label(
+                self.frame,
+                text=row.label,
+                fg=fg,
+                bg=MENU_BG if row.clickable else MENU_DISABLED_BG,
+                font=("Segoe UI", 9),
+                anchor="w",
+                justify="left",
+                padx=10,
+                pady=3,
+                wraplength=460,
+            )
+            label.pack(fill="x")
+            if row.clickable:
+                label.configure(cursor="hand2")
+                label.bind("<Enter>", lambda _event, item=label: item.configure(bg=MENU_HOVER))
+                label.bind("<Leave>", lambda _event, item=label: item.configure(bg=MENU_BG))
+                label.bind("<Button-1>", lambda _event, item=row: self._invoke(item))
+
+    def show(self, x: int, y: int) -> None:
+        self.window.update_idletasks()
+        width = max(1, int(self.window.winfo_width()))
+        height = max(1, int(self.window.winfo_height()))
+        menu_x, menu_y = clamp_popup_position([x, y], self.app.screen_bounds(), (width, height))
+        self.window.geometry(f"+{menu_x}+{menu_y}")
+        self.window.deiconify()
+        self.window.lift()
+        try:
+            self.window.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        try:
+            self.window.grab_set()
+        except tk.TclError:
+            pass
+        try:
+            self.window.focus_force()
+        except tk.TclError:
+            pass
+        self.window.after(150, self._enable_focus_dismiss)
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            if self.window.grab_current() == self.window:
+                self.window.grab_release()
+        except tk.TclError:
+            pass
+        try:
+            self.window.destroy()
+        except tk.TclError:
+            pass
+
+    def _enable_focus_dismiss(self) -> None:
+        self.focus_dismiss_enabled = True
+
+    def _invoke(self, row: MenuRow) -> str:
+        if not self.closed:
+            row.invoke()
+        return "break"
+
+    def _dismiss(self, _event: tk.Event | None = None) -> str:
+        self.app.finish_menu_interaction()
+        return "break"
+
+    def _schedule_focus_dismiss(self, _event: tk.Event | None = None) -> None:
+        if self.focus_dismiss_enabled:
+            self.window.after(50, self._dismiss_if_focus_lost)
+
+    def _dismiss_if_focus_lost(self) -> None:
+        if self.closed:
+            return
+        try:
+            focused = self.window.focus_displayof()
+        except tk.TclError:
+            focused = None
+        if focused is None or not self._is_descendant(focused):
+            self.app.finish_menu_interaction()
+
+    def _dismiss_if_outside(self, event: tk.Event) -> str | None:
+        if not self._point_inside(int(event.x_root), int(event.y_root)):
+            self.app.finish_menu_interaction()
+            return "break"
+        return None
+
+    def _point_inside(self, x: int, y: int) -> bool:
+        try:
+            left = int(self.window.winfo_rootx())
+            top = int(self.window.winfo_rooty())
+            width = int(self.window.winfo_width())
+            height = int(self.window.winfo_height())
+        except tk.TclError:
+            return False
+        return left <= x < left + width and top <= y < top + height
+
+    def _is_descendant(self, widget: tk.Widget) -> bool:
+        while widget is not None:
+            if widget == self.window:
+                return True
+            widget = widget.master
+        return False
+
+
 class OverlayApp:
     def __init__(self) -> None:
         self.settings_path = settings_path()
@@ -1614,8 +1803,7 @@ class OverlayApp:
         self.drag_offset: tuple[int, int] | None = None
         self.is_dragging = False
         self.menu_active = False
-        self.menu_opened_at = 0.0
-        self.menu_observed_mapped = False
+        self.menu_window: ContextMenuWindow | None = None
         self.needs_render_after_drag = False
         self.needs_render_after_menu = False
         self.needs_visibility_after_menu = False
@@ -1635,9 +1823,6 @@ class OverlayApp:
         self.container = tk.Frame(self.root, bg=COLOR_BG, padx=8, pady=5)
         self.container.pack(padx=1, pady=1)
         self.labels: list[tk.Label] = []
-
-        self.menu = Menu(self.root, tearoff=False)
-        self.menu.bind("<Unmap>", self.on_menu_unmapped)
 
         self._bind_window_events(self.root)
         self._bind_window_events(self.container)
@@ -1841,18 +2026,14 @@ class OverlayApp:
     def show_menu(self, event: tk.Event) -> None:
         if self.is_dragging:
             return
+        if self.menu_active:
+            self.finish_menu_interaction()
         self.begin_menu_interaction()
-        self.rebuild_menu()
-        try:
-            self.menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self.menu.grab_release()
-        self.schedule_menu_close_poll()
+        self.menu_window = ContextMenuWindow(self, self.build_menu_rows())
+        self.menu_window.show(int(event.x_root), int(event.y_root))
 
     def begin_menu_interaction(self) -> None:
         self.menu_active = True
-        self.menu_opened_at = time.time()
-        self.menu_observed_mapped = False
         self.needs_render_after_menu = False
         self.needs_visibility_after_menu = False
         try:
@@ -1860,43 +2041,13 @@ class OverlayApp:
         except tk.TclError:
             pass
 
-    def schedule_menu_close_poll(self) -> None:
-        try:
-            self.root.after(MENU_CLOSE_POLL_MS, self.poll_menu_closed)
-        except tk.TclError:
-            pass
-
-    def poll_menu_closed(self) -> None:
-        if not self.menu_active:
-            return
-        try:
-            menu_is_mapped = bool(self.menu.winfo_ismapped())
-        except tk.TclError:
-            menu_is_mapped = False
-        if menu_is_mapped:
-            self.menu_observed_mapped = True
-            self.schedule_menu_close_poll()
-        elif self.menu_observed_mapped:
-            self.finish_menu_interaction()
-        elif time.time() - self.menu_opened_at < MENU_UNOBSERVED_FALLBACK_SECONDS:
-            self.schedule_menu_close_poll()
-        else:
-            self.finish_menu_interaction()
-
-    def on_menu_unmapped(self, _event: tk.Event | None = None) -> None:
-        if not self.menu_active:
-            return
-        try:
-            self.root.after_idle(self.finish_menu_interaction)
-        except tk.TclError:
-            pass
-
     def finish_menu_interaction(self) -> None:
         if not self.menu_active:
             return
+        if self.menu_window is not None:
+            self.menu_window.close()
+            self.menu_window = None
         self.menu_active = False
-        self.menu_opened_at = 0.0
-        self.menu_observed_mapped = False
         if self.needs_render_after_menu:
             self.request_render(force=True)
         else:
@@ -1907,13 +2058,10 @@ class OverlayApp:
         try:
             action()
         finally:
-            try:
-                self.root.after_idle(self.finish_menu_interaction)
-            except tk.TclError:
-                pass
+            self.finish_menu_interaction()
 
-    def rebuild_menu(self) -> None:
-        self.menu.delete(0, tk.END)
+    def build_menu_rows(self) -> list[MenuRow]:
+        rows: list[MenuRow] = []
         current_visibility = normalize_visibility_mode(self.settings.get("visibility_mode"))
         current_windows = set(normalize_display_windows(self.settings.get("display_windows")))
         show_resets = bool(self.settings.get("show_resets", False))
@@ -1921,14 +2069,14 @@ class OverlayApp:
         show_api_cost_estimate = bool(self.settings.get("show_api_cost_estimate", False))
         current_layout = normalize_layout_mode(self.settings.get("layout_mode"))
 
-        self.menu.add_command(label=self.status_text(), state=tk.DISABLED)
+        rows.append(MenuRow.disabled(self.status_text()))
         if self.snapshot and self.snapshot.plan_type:
-            self.menu.add_command(label=f"Plan: {self.snapshot.plan_type}", state=tk.DISABLED)
+            rows.append(MenuRow.disabled(f"Plan: {self.snapshot.plan_type}"))
         if self.snapshot:
-            self.menu.add_command(label=self.source_status_text(), state=tk.DISABLED)
-        self.menu.add_separator()
+            rows.append(MenuRow.disabled(self.source_status_text()))
+        rows.append(MenuRow.separator())
 
-        self.menu.add_command(label="Visibility", state=tk.DISABLED)
+        rows.append(MenuRow.disabled("Visibility"))
         visibility_items = [
             ("Always", "always"),
             ("When Codex process is running", "process"),
@@ -1938,47 +2086,59 @@ class OverlayApp:
         for label, mode in visibility_items:
             supported = self.process_backend.is_supported(mode)
             item_label = label if supported else f"{label} (Windows only)"
-            self.menu.add_command(
-                label=selected_menu_label(item_label, current_visibility == mode),
-                command=lambda selected=mode: self.run_menu_command(lambda: self.set_visibility_mode(selected)),
-                state=tk.NORMAL if supported else tk.DISABLED,
+            rows.append(
+                MenuRow.command(
+                    selected_menu_label(item_label, current_visibility == mode),
+                    lambda selected=mode: self.run_menu_command(lambda: self.set_visibility_mode(selected)),
+                    enabled=supported,
+                )
             )
 
-        self.menu.add_separator()
-        self.menu.add_command(label="Rate Windows", state=tk.DISABLED)
+        rows.append(MenuRow.separator())
+        rows.append(MenuRow.disabled("Rate Windows"))
         for key in VALID_DISPLAY_WINDOWS:
-            self.menu.add_command(
-                label=checked_menu_label(long_window_label(key, self.get_window(key)), key in current_windows),
-                command=lambda selected=key: self.run_menu_command(lambda: self.toggle_display_window(selected)),
+            rows.append(
+                MenuRow.command(
+                    checked_menu_label(long_window_label(key, self.get_window(key)), key in current_windows),
+                    lambda selected=key: self.run_menu_command(lambda: self.toggle_display_window(selected)),
+                )
             )
-        self.menu.add_command(
-            label=checked_menu_label("Show Reset Countdown", show_resets),
-            command=lambda: self.run_menu_command(self.toggle_show_resets),
+        rows.append(
+            MenuRow.command(
+                checked_menu_label("Show Reset Countdown", show_resets),
+                lambda: self.run_menu_command(self.toggle_show_resets),
+            )
         )
-        self.menu.add_command(
-            label=checked_menu_label("Show Token Counter", show_token_counter),
-            command=lambda: self.run_menu_command(self.toggle_show_token_counter),
+        rows.append(
+            MenuRow.command(
+                checked_menu_label("Show Token Counter", show_token_counter),
+                lambda: self.run_menu_command(self.toggle_show_token_counter),
+            )
         )
-        self.menu.add_command(
-            label=checked_menu_label("Show API Cost Estimate", show_api_cost_estimate),
-            command=lambda: self.run_menu_command(self.toggle_show_api_cost_estimate),
+        rows.append(
+            MenuRow.command(
+                checked_menu_label("Show API Cost Estimate", show_api_cost_estimate),
+                lambda: self.run_menu_command(self.toggle_show_api_cost_estimate),
+            )
         )
 
-        self.menu.add_separator()
-        self.menu.add_command(label="Layout", state=tk.DISABLED)
+        rows.append(MenuRow.separator())
+        rows.append(MenuRow.disabled("Layout"))
         layout_items = [
             ("Horizontal", "horizontal"),
             ("Vertical", "vertical"),
             ("2x2 Grid", "grid_2x2"),
         ]
         for label, mode in layout_items:
-            self.menu.add_command(
-                label=selected_menu_label(label, current_layout == mode),
-                command=lambda selected=mode: self.run_menu_command(lambda: self.set_layout_mode(selected)),
+            rows.append(
+                MenuRow.command(
+                    selected_menu_label(label, current_layout == mode),
+                    lambda selected=mode: self.run_menu_command(lambda: self.set_layout_mode(selected)),
+                )
             )
 
         if self.snapshot:
-            self.menu.add_separator()
+            rows.append(MenuRow.separator())
             for key in normalize_display_windows(self.settings["display_windows"]):
                 rate_window = self.get_window(key)
                 if rate_window:
@@ -1987,76 +2147,77 @@ class OverlayApp:
                         if rate_window.remaining_percent is None
                         else f"{rate_window.remaining_percent}% remaining"
                     )
-                    self.menu.add_command(
-                        label=f"{rate_window.label}: {value}, resets {format_reset_time(rate_window.resets_at)}",
-                        state=tk.DISABLED,
+                    rows.append(
+                        MenuRow.disabled(
+                            f"{rate_window.label}: {value}, resets {format_reset_time(rate_window.resets_at)}"
+                        )
                     )
 
-        self.menu.add_separator()
-        self.menu.add_command(label="Token Counter", state=tk.DISABLED)
-        self.menu.add_command(label=self.token_counter.display_text(), state=tk.DISABLED)
-        self.menu.add_command(
-            label=(
+        rows.append(MenuRow.separator())
+        rows.append(MenuRow.disabled("Token Counter"))
+        rows.append(MenuRow.disabled(self.token_counter.display_text()))
+        rows.append(
+            MenuRow.disabled(
                 f"Input {format_token_count(self.token_counter.totals.input_tokens)}, "
                 f"cached {format_token_count(self.token_counter.totals.cached_input_tokens)}, "
                 f"output {format_token_count(self.token_counter.totals.output_tokens)}, "
                 f"reasoning {format_token_count(self.token_counter.totals.reasoning_output_tokens)}"
-            ),
-            state=tk.DISABLED,
+            )
         )
-        self.menu.add_command(label=f"Reset {format_snapshot_time(datetime.fromtimestamp(self.token_counter.reset_at, timezone.utc).isoformat())}", state=tk.DISABLED)
-        self.menu.add_command(label="Reset Token Counter", command=lambda: self.run_menu_command(self.reset_token_counter))
+        rows.append(
+            MenuRow.disabled(
+                f"Reset {format_snapshot_time(datetime.fromtimestamp(self.token_counter.reset_at, timezone.utc).isoformat())}"
+            )
+        )
+        rows.append(MenuRow.command("Reset Token Counter", lambda: self.run_menu_command(self.reset_token_counter)))
 
-        self.add_api_estimate_menu_items()
+        self.add_api_estimate_menu_rows(rows)
 
-        self.menu.add_separator()
-        self.menu.add_command(label="Refresh", command=lambda: self.run_menu_command(self.manual_refresh))
-        self.menu.add_command(label="Reset position", command=lambda: self.run_menu_command(self.reset_position))
-        self.menu.add_command(label="Quit", command=lambda: self.run_menu_command(self.quit))
+        rows.append(MenuRow.separator())
+        rows.append(MenuRow.command("Refresh", lambda: self.run_menu_command(self.manual_refresh)))
+        rows.append(MenuRow.command("Reset position", lambda: self.run_menu_command(self.reset_position)))
+        rows.append(MenuRow.command("Quit", lambda: self.run_menu_command(self.quit)))
+        return rows
 
-    def add_api_estimate_menu_items(self) -> None:
+    def add_api_estimate_menu_rows(self, rows: list[MenuRow]) -> None:
         estimate = self.current_api_cost_estimate()
         model_name = estimate.model or "unknown"
-        self.menu.add_separator()
-        self.menu.add_command(label="API Estimate", state=tk.DISABLED)
-        self.menu.add_command(label=format_api_cost_estimate(estimate), state=tk.DISABLED)
-        self.menu.add_command(
-            label=f"Model: {model_name} ({estimate.model_source}); tier: Standard (assumed)",
-            state=tk.DISABLED,
+        rows.append(MenuRow.separator())
+        rows.append(MenuRow.disabled("API Estimate"))
+        rows.append(MenuRow.disabled(format_api_cost_estimate(estimate)))
+        rows.append(
+            MenuRow.disabled(f"Model: {model_name} ({estimate.model_source}); tier: Standard (assumed)")
         )
-        self.menu.add_command(
-            label=(
+        rows.append(
+            MenuRow.disabled(
                 f"Tokens: input {format_token_count(estimate.uncached_input_tokens)}, "
                 f"cached {format_token_count(estimate.cached_input_tokens)}, "
                 f"output {format_token_count(estimate.output_tokens)}"
-            ),
-            state=tk.DISABLED,
+            )
         )
 
         if estimate.pricing is None:
-            self.menu.add_command(label=f"No pricing row configured for {model_name}", state=tk.DISABLED)
+            rows.append(MenuRow.disabled(f"No pricing row configured for {model_name}"))
         else:
             cached_rate = estimate.pricing.cached_input_per_million
-            self.menu.add_command(
-                label=(
+            rows.append(
+                MenuRow.disabled(
                     f"Rates /1M: input {format_api_rate(estimate.pricing.input_per_million)}, "
                     f"cached {format_api_rate(cached_rate)}, "
                     f"output {format_api_rate(estimate.pricing.output_per_million)}"
-                ),
-                state=tk.DISABLED,
+                )
             )
-            self.menu.add_command(
-                label=(
+            rows.append(
+                MenuRow.disabled(
                     f"Costs: input {format_api_cost(estimate.input_cost)}, "
                     f"cached {format_api_cost(estimate.cached_input_cost)}, "
                     f"output {format_api_cost(estimate.output_cost)}"
-                ),
-                state=tk.DISABLED,
+                )
             )
 
         if estimate.warning:
-            self.menu.add_command(label=estimate.warning, state=tk.DISABLED)
-        self.menu.add_command(label="API-equivalent estimate only; not actual Codex billing", state=tk.DISABLED)
+            rows.append(MenuRow.disabled(estimate.warning))
+        rows.append(MenuRow.disabled("API-equivalent estimate only; not actual Codex billing"))
 
     def status_text(self) -> str:
         if self.reader.last_error:

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.5 - 2026-06-08
+
+- Replace the native Tk context menu with a custom owned Tk menu window.
+- Capture menu clicks explicitly so first-click menu selections do not pass through to the Codex window underneath.
+- Keep the custom menu topmost while the overlay itself stays beneath it.
+
 ## 0.1.4 - 2026-06-07
 
 - Prevent the overlay refresh loop from raising the overlay over the context menu.

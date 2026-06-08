@@ -127,9 +127,11 @@ The app also clamps saved positions to the visible screen area on launch.
 
 ### Dragging or right-click menu feels unreliable
 
-Update to `0.1.4` or newer, then check for old processes and restart the app.
-The overlay prevents duplicate instances so overlapping windows do not fight for
-clicks.
+Update to `0.1.5` or newer, then check for old processes and restart the app.
+The right-click menu is a custom owned Tk window rather than a native Tk popup,
+which avoids first clicks falling through to Codex behind the overlay. The
+overlay also prevents duplicate instances so overlapping windows do not fight
+for clicks.
 
 ```powershell
 Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*codex_usage_overlay.pyw*' }
