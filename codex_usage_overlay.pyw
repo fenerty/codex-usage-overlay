@@ -28,7 +28,7 @@ from typing import Any, Callable
 
 
 APP_NAME = "Codex Usage Overlay"
-APP_VERSION = "0.1.6"
+APP_VERSION = "0.1.7"
 SETTINGS_FILE_NAME = "codex_usage_overlay.settings.json"
 RUNTIME_STATE_FILE_NAME = "codex-usage-overlay-state.json"
 INSTANCE_LOCK_FILE_NAME = "codex-usage-overlay.lock"
@@ -39,6 +39,8 @@ VALID_LAYOUT_MODES = ("horizontal", "vertical", "grid_2x2")
 VALID_VISIBILITY_MODES = ("always", "process", "foreground", "visible_window")
 CODEX_PROCESS_NAMES = {"codex.exe"}
 GENERIC_CODEX_PROCESS_NAMES = {"codex", "codex.exe"}
+WINDOWS_CHATGPT_PROCESS_NAME = "chatgpt.exe"
+WINDOWS_CODEX_PACKAGE_PREFIX = "openai.codex_"
 DEFAULT_OPACITY = 0.9
 POLL_INTERVAL_MS = 500
 MIN_VISIBLE_PIXELS = 24
@@ -55,6 +57,7 @@ SQLITE_RATE_ROWS_TO_SCAN = 200
 API_PRICING_ASSUMPTION = "Standard API pricing assumed"
 API_PRICING_SOURCE_URL = "https://developers.openai.com/api/docs/models/compare"
 GPT_55_PRICING_SOURCE_URL = "https://developers.openai.com/api/docs/models/gpt-5.5"
+GPT_54_MINI_PRICING_SOURCE_URL = "https://developers.openai.com/api/docs/models/gpt-5.4-mini"
 TOKEN_USAGE_KEYS = (
     "input_tokens",
     "cached_input_tokens",
@@ -137,6 +140,13 @@ class ModelPricing:
 
 
 @dataclass(frozen=True)
+class PricingResolution:
+    pricing_model: str
+    pricing: ModelPricing
+    is_proxy: bool = False
+
+
+@dataclass(frozen=True)
 class DetectedModel:
     model: str | None
     source: str
@@ -147,6 +157,8 @@ class ApiCostEstimate:
     model: str | None
     model_source: str
     pricing: ModelPricing | None
+    pricing_model: str | None
+    pricing_is_proxy: bool
     uncached_input_tokens: int
     cached_input_tokens: int
     output_tokens: int
@@ -212,11 +224,19 @@ class LogReadBatch:
 # Current official OpenAI API prices, per 1M text tokens.
 # Sources:
 # - https://developers.openai.com/api/docs/models/gpt-5.5
+# - https://developers.openai.com/api/docs/models/gpt-5.4-mini
 # - https://developers.openai.com/api/docs/models/compare
 API_MODEL_PRICING = {
     "gpt-5.5": ModelPricing("gpt-5.5", 5.00, 0.50, 30.00, GPT_55_PRICING_SOURCE_URL),
     "gpt-5.5-pro": ModelPricing("gpt-5.5 pro", 30.00, None, 180.00, API_PRICING_SOURCE_URL),
     "gpt-5.4": ModelPricing("gpt-5.4", 2.50, 0.25, 15.00, API_PRICING_SOURCE_URL),
+    "gpt-5.4-mini": ModelPricing("gpt-5.4 mini", 0.75, 0.075, 4.50, GPT_54_MINI_PRICING_SOURCE_URL),
+}
+API_PRICING_PROXY_MODELS = {
+    "gpt-5.6-sol": "gpt-5.5",
+    "gpt-5.6-terra": "gpt-5.5",
+    "gpt-5.6-luna": "gpt-5.5",
+    "gpt-5.3-codex-spark": "gpt-5.5",
 }
 
 
@@ -390,6 +410,22 @@ def pricing_for_model(model: str | None) -> ModelPricing | None:
     return API_MODEL_PRICING.get(key)
 
 
+def resolve_model_pricing(model: str | None) -> PricingResolution | None:
+    key = normalize_model_key(model)
+    if key is None:
+        return None
+
+    exact_pricing = API_MODEL_PRICING.get(key)
+    if exact_pricing is not None:
+        return PricingResolution(pricing_model=key, pricing=exact_pricing)
+
+    proxy_model = API_PRICING_PROXY_MODELS.get(key)
+    proxy_pricing = API_MODEL_PRICING.get(proxy_model) if proxy_model else None
+    if proxy_model is None or proxy_pricing is None:
+        return None
+    return PricingResolution(pricing_model=proxy_model, pricing=proxy_pricing, is_proxy=True)
+
+
 def extract_model_from_text(text: str | None) -> str | None:
     if not text:
         return None
@@ -456,7 +492,8 @@ def estimate_api_cost(
     cached_input_tokens = min(usage.cached_input_tokens, usage.input_tokens)
     uncached_input_tokens = max(0, usage.input_tokens - cached_input_tokens)
     output_tokens = usage.output_tokens
-    pricing = pricing_for_model(detected_model.model)
+    pricing_resolution = resolve_model_pricing(detected_model.model)
+    pricing = pricing_resolution.pricing if pricing_resolution else None
 
     warning = None
     if (
@@ -471,6 +508,8 @@ def estimate_api_cost(
             model=detected_model.model,
             model_source=detected_model.source,
             pricing=None,
+            pricing_model=None,
+            pricing_is_proxy=False,
             uncached_input_tokens=uncached_input_tokens,
             cached_input_tokens=cached_input_tokens,
             output_tokens=output_tokens,
@@ -492,6 +531,8 @@ def estimate_api_cost(
         model=detected_model.model,
         model_source=detected_model.source,
         pricing=pricing,
+        pricing_model=pricing_resolution.pricing_model,
+        pricing_is_proxy=pricing_resolution.is_proxy,
         uncached_input_tokens=uncached_input_tokens,
         cached_input_tokens=cached_input_tokens,
         output_tokens=output_tokens,
@@ -519,9 +560,19 @@ def format_api_rate(value: float | None) -> str:
     return format_api_cost(value)
 
 
+def format_model_name(model: str | None) -> str:
+    if not model:
+        return "unknown"
+    if model.lower().startswith("gpt-"):
+        return model.upper()
+    return model
+
+
 def format_api_cost_estimate(estimate: ApiCostEstimate) -> str:
     if estimate.total_cost is None:
         return "API est. --"
+    if estimate.pricing_is_proxy:
+        return f"{format_api_cost(estimate.total_cost)} API est. ({format_model_name(estimate.pricing_model)} proxy)"
     return f"{format_api_cost(estimate.total_cost)} API est."
 
 
@@ -545,6 +596,8 @@ def api_cost_estimate_to_dict(estimate: ApiCostEstimate | None) -> dict[str, Any
         "model": estimate.model,
         "model_source": estimate.model_source,
         "pricing": model_pricing_to_dict(estimate.pricing),
+        "pricing_model": estimate.pricing_model,
+        "pricing_is_proxy": estimate.pricing_is_proxy,
         "uncached_input_tokens": estimate.uncached_input_tokens,
         "cached_input_tokens": estimate.cached_input_tokens,
         "output_tokens": estimate.output_tokens,
@@ -1669,33 +1722,83 @@ def windows_codex_pids() -> set[int]:
         entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
         has_entry = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
         while has_entry:
-            if entry.szExeFile.lower() in CODEX_PROCESS_NAMES:
-                pids.add(int(entry.th32ProcessID))
+            process_name = entry.szExeFile.lower()
+            if process_name in CODEX_PROCESS_NAMES or process_name == WINDOWS_CHATGPT_PROCESS_NAME:
+                pid = int(entry.th32ProcessID)
+                if windows_pid_is_codex(pid, process_name):
+                    pids.add(pid)
             has_entry = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
     finally:
         kernel32.CloseHandle(snapshot)
     return pids
 
 
-def windows_process_name(pid: int) -> str:
-    if platform.system() != "Windows":
+def windows_process_path(pid: int) -> str:
+    if platform.system() != "Windows" or pid <= 0:
         return ""
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    psapi = ctypes.WinDLL("psapi", use_last_error=True)
-    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-    PROCESS_VM_READ = 0x0010
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [
+            ctypes.wintypes.DWORD,
+            ctypes.wintypes.BOOL,
+            ctypes.wintypes.DWORD,
+        ]
+        kernel32.OpenProcess.restype = ctypes.wintypes.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            ctypes.wintypes.HANDLE,
+            ctypes.wintypes.DWORD,
+            ctypes.wintypes.LPWSTR,
+            ctypes.POINTER(ctypes.wintypes.DWORD),
+        ]
+        kernel32.QueryFullProcessImageNameW.restype = ctypes.wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+        kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+    except (OSError, AttributeError):
+        return ""
 
-    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, False, pid)
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         return ""
     try:
-        buffer = ctypes.create_unicode_buffer(260)
-        if psapi.GetModuleBaseNameW(handle, None, buffer, len(buffer)):
-            return buffer.value.lower()
+        buffer = ctypes.create_unicode_buffer(32_768)
+        size = ctypes.wintypes.DWORD(len(buffer))
+        if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return buffer.value
     finally:
         kernel32.CloseHandle(handle)
     return ""
+
+
+def windows_path_process_name(executable_path: str | None) -> str:
+    if not executable_path:
+        return ""
+    return re.split(r"[\\/]", executable_path.strip())[-1].lower()
+
+
+def is_codex_windows_process(process_name: str | None, executable_path: str | None = None) -> bool:
+    normalized_name = (process_name or "").strip().lower()
+    if normalized_name in CODEX_PROCESS_NAMES:
+        return True
+    if normalized_name != WINDOWS_CHATGPT_PROCESS_NAME or not executable_path:
+        return False
+    path_parts = [part.lower() for part in re.split(r"[\\/]", executable_path) if part]
+    return any(part.startswith(WINDOWS_CODEX_PACKAGE_PREFIX) for part in path_parts)
+
+
+def windows_pid_is_codex(pid: int, process_name: str | None = None) -> bool:
+    normalized_name = (process_name or "").strip().lower()
+    if normalized_name in CODEX_PROCESS_NAMES:
+        return True
+    executable_path = windows_process_path(pid)
+    if not normalized_name:
+        normalized_name = windows_path_process_name(executable_path)
+    return is_codex_windows_process(normalized_name, executable_path)
+
+
+def windows_process_name(pid: int) -> str:
+    return windows_path_process_name(windows_process_path(pid))
 
 
 def windows_foreground_is_codex() -> bool:
@@ -1708,7 +1811,7 @@ def windows_foreground_is_codex() -> bool:
         return False
     pid = ctypes.wintypes.DWORD()
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    return windows_process_name(int(pid.value)) in CODEX_PROCESS_NAMES
+    return windows_pid_is_codex(int(pid.value))
 
 
 def windows_has_visible_codex_window() -> bool:
@@ -1730,7 +1833,7 @@ def windows_has_visible_codex_window() -> bool:
 
         pid = ctypes.wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if windows_process_name(int(pid.value)) in CODEX_PROCESS_NAMES:
+        if windows_pid_is_codex(int(pid.value)):
             matches["found"] = True
             return False
         return True
@@ -2427,9 +2530,14 @@ class OverlayApp:
         rows.append(MenuRow.separator())
         rows.append(MenuRow.disabled("API Estimate"))
         rows.append(MenuRow.disabled(format_api_cost_estimate(estimate)))
-        rows.append(
-            MenuRow.disabled(f"Model: {model_name} ({estimate.model_source}); tier: Standard (assumed)")
-        )
+        rows.append(MenuRow.disabled(f"Detected model: {model_name} ({estimate.model_source})"))
+        if estimate.pricing is None:
+            rows.append(MenuRow.disabled("Pricing model: unavailable"))
+        else:
+            pricing_label = format_model_name(estimate.pricing_model)
+            if estimate.pricing_is_proxy:
+                pricing_label += " proxy"
+            rows.append(MenuRow.disabled(f"Pricing model: {pricing_label}; tier: Standard (assumed)"))
         rows.append(
             MenuRow.disabled(
                 f"Tokens: input {format_token_count(estimate.uncached_input_tokens)}, "

@@ -23,13 +23,16 @@ This is an independent utility and is not an official OpenAI or Codex project.
   OpenAI API pricing constants.
 - Right-click menu for visibility modes, display toggles, layout, refresh, reset
   position, token-counter reset, and status details.
+- Package-aware Windows visibility for both legacy `codex.exe` and the unified
+  `ChatGPT.exe` host shipped in the `OpenAI.Codex` package.
 - No third-party packages, no network calls, and no `auth.json` access.
 
 ## Requirements
 
 - Windows is the primary supported platform.
 - Python 3.11 or newer with Tkinter available.
-- Codex installed and writing local session/log data under `~/.codex`.
+- Codex CLI or the Codex-capable ChatGPT desktop app installed and writing local
+  session/log data under `~/.codex`.
 
 Limited non-Windows behavior is supported for always-visible mode and local log
 reading, but foreground/window visibility detection is Windows-only.
@@ -114,6 +117,8 @@ normal quit.
 - Displayed rate limits are only as fresh as the local Codex logs.
 - The API cost estimate is approximate and is not actual Codex subscription
   billing.
+- Preview-only Codex models without published API pricing use a clearly labeled
+  GPT-5.5 proxy. Unknown, custom, and future models remain unpriced.
 - If models change during a manual token-counter window, reset the counter for a
   cleaner cost estimate.
 
@@ -124,6 +129,10 @@ normal quit.
 The overlay saves its last screen position in `codex_usage_overlay.settings.json`.
 If your monitor layout changed, delete the `position` value or set it to `null`.
 The app also clamps saved positions to the visible screen area on launch.
+
+For the unified Windows desktop app, use version `0.1.7` or newer so the
+`foreground` and `visible_window` modes recognize the packaged `ChatGPT.exe`
+host. Other ChatGPT installations are intentionally ignored.
 
 ### Dragging or right-click menu feels unreliable
 

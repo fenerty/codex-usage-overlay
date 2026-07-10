@@ -110,6 +110,41 @@ class RateParserTests(unittest.TestCase):
         self.assertEqual(snapshot.secondary.label, "7d")
         self.assertEqual(snapshot.secondary.remaining_percent, 94)
 
+    def test_parses_current_desktop_app_rate_and_token_shape(self):
+        event = json.loads(
+            token_count_line(
+                "2026-07-09T19:47:52.000Z",
+                primary={"used_percent": 20.0, "window_minutes": 300, "resets_at": 1783645200},
+                secondary={"used_percent": 12.0, "window_minutes": 10080, "resets_at": 1784246400},
+                last_usage={
+                    "input_tokens": 1_000,
+                    "cached_input_tokens": 800,
+                    "output_tokens": 200,
+                    "reasoning_output_tokens": 100,
+                    "total_tokens": 1_200,
+                },
+                total_usage={"total_tokens": 5_000},
+            )
+        )
+        event["payload"]["rate_limits"] = event.pop("rate_limits")
+        event["payload"]["rate_limits"].update(
+            {
+                "credits": {"has_credits": False},
+                "individual_limit": None,
+                "limit_name": None,
+            }
+        )
+        line = json.dumps(event)
+
+        snapshot = overlay.parse_rate_line(line)
+        token_event = overlay.parse_token_event_line(line)
+
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.primary.remaining_percent, 80)
+        self.assertEqual(snapshot.secondary.remaining_percent, 88)
+        self.assertIsNotNone(token_event)
+        self.assertEqual(token_event.usage.cached_input_tokens, 800)
+
     def test_parses_one_missing_window(self):
         line = token_count_line(
             "2026-05-30T20:26:33.794Z",
@@ -644,8 +679,48 @@ class ApiCostEstimateTests(unittest.TestCase):
         )
 
         self.assertIsNone(estimate.pricing)
+        self.assertIsNone(estimate.pricing_model)
+        self.assertFalse(estimate.pricing_is_proxy)
         self.assertIsNone(estimate.total_cost)
         self.assertEqual(overlay.format_api_cost_estimate(estimate), "API est. --")
+
+    def test_uses_exact_gpt_54_mini_pricing(self):
+        estimate = overlay.estimate_api_cost(
+            overlay.TokenUsage(
+                input_tokens=1_000_000,
+                cached_input_tokens=200_000,
+                output_tokens=1_000_000,
+                total_tokens=2_000_000,
+            ),
+            overlay.DetectedModel("gpt-5.4-mini", "test"),
+        )
+
+        self.assertEqual(estimate.pricing_model, "gpt-5.4-mini")
+        self.assertFalse(estimate.pricing_is_proxy)
+        self.assertAlmostEqual(estimate.input_cost, 0.60)
+        self.assertAlmostEqual(estimate.cached_input_cost, 0.015)
+        self.assertAlmostEqual(estimate.output_cost, 4.50)
+        self.assertAlmostEqual(estimate.total_cost, 5.115)
+
+    def test_preview_codex_models_use_labeled_gpt_55_proxy(self):
+        proxy_models = (
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.3-codex-spark",
+        )
+
+        for model in proxy_models:
+            with self.subTest(model=model):
+                estimate = overlay.estimate_api_cost(
+                    overlay.TokenUsage(input_tokens=1_000, output_tokens=1_000, total_tokens=2_000),
+                    overlay.DetectedModel(model, "test"),
+                )
+
+                self.assertEqual(estimate.pricing_model, "gpt-5.5")
+                self.assertTrue(estimate.pricing_is_proxy)
+                self.assertIsNotNone(estimate.total_cost)
+                self.assertIn("GPT-5.5 proxy", overlay.format_api_cost_estimate(estimate))
 
     def test_formats_costs(self):
         self.assertEqual(overlay.format_api_cost(0), "$0.00")
@@ -714,7 +789,7 @@ class RuntimeStateTests(unittest.TestCase):
             counter = overlay.TokenCounter(reset_at=1_000)
             estimate = overlay.estimate_api_cost(
                 overlay.TokenUsage(input_tokens=1_000, output_tokens=1_000, total_tokens=2_000),
-                overlay.DetectedModel("gpt-5.5", "test"),
+                overlay.DetectedModel("gpt-5.6-sol", "test"),
             )
             snapshot = overlay.RateSnapshot(
                 timestamp="2026-06-02T17:20:43+00:00",
@@ -735,7 +810,9 @@ class RuntimeStateTests(unittest.TestCase):
             self.assertIn("token_counter", state)
             self.assertIn("last_rate_snapshot", state)
             self.assertIn("api_cost_estimate", state)
-            self.assertEqual(state["api_cost_estimate"]["model"], "gpt-5.5")
+            self.assertEqual(state["api_cost_estimate"]["model"], "gpt-5.6-sol")
+            self.assertEqual(state["api_cost_estimate"]["pricing_model"], "gpt-5.5")
+            self.assertTrue(state["api_cost_estimate"]["pricing_is_proxy"])
             self.assertEqual(state["rate_source"], "logs_2.sqlite")
             self.assertEqual(state["source_event_timestamp"], "2026-06-02T17:20:43+00:00")
             self.assertEqual(state["source_observed_at"], 1780420843)
@@ -761,6 +838,74 @@ class RuntimeStateTests(unittest.TestCase):
             store.delete()
 
             self.assertFalse(path.exists())
+
+
+class ProcessIdentityTests(unittest.TestCase):
+    def test_classifies_legacy_and_packaged_codex_processes(self):
+        cases = (
+            ("codex.exe", None, True),
+            ("CODEX.EXE", "", True),
+            (
+                "ChatGPT.exe",
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_26.707.3563.0_x64__2p2nqsd0c76g\ChatGPT.exe",
+                True,
+            ),
+            (
+                "CHATGPT.EXE",
+                r"c:\program files\windowsapps\OPENAI.CODEX_26.707.3563.0_X64__2P2NQSD0C76G\CHATGPT.EXE",
+                True,
+            ),
+            (
+                "ChatGPT.exe",
+                r"C:\Program Files\WindowsApps\OpenAI.ChatGPT_2.0_x64__example\ChatGPT.exe",
+                False,
+            ),
+            ("ChatGPT.exe", r"C:\Apps\ChatGPT.exe", False),
+            (
+                "notepad.exe",
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_26.707.3563.0_x64__2p2nqsd0c76g\notepad.exe",
+                False,
+            ),
+        )
+
+        for process_name, executable_path, expected in cases:
+            with self.subTest(process_name=process_name, executable_path=executable_path):
+                self.assertEqual(
+                    overlay.is_codex_windows_process(process_name, executable_path),
+                    expected,
+                )
+
+    def test_packaged_chatgpt_pid_fails_closed_when_path_is_unavailable(self):
+        original_process_path = overlay.windows_process_path
+        overlay.windows_process_path = lambda _pid: ""
+        try:
+            self.assertFalse(overlay.windows_pid_is_codex(123, "ChatGPT.exe"))
+            self.assertTrue(overlay.windows_pid_is_codex(123, "codex.exe"))
+        finally:
+            overlay.windows_process_path = original_process_path
+
+    def test_process_backend_routes_each_windows_visibility_mode(self):
+        backend = overlay.ProcessBackend()
+        calls = []
+        original_system = overlay.platform.system
+        original_pids = overlay.windows_codex_pids
+        original_foreground = overlay.windows_foreground_is_codex
+        original_visible = overlay.windows_has_visible_codex_window
+        overlay.platform.system = lambda: "Windows"
+        overlay.windows_codex_pids = lambda: calls.append("process") or {123}
+        overlay.windows_foreground_is_codex = lambda: calls.append("foreground") or True
+        overlay.windows_has_visible_codex_window = lambda: calls.append("visible_window") or True
+        try:
+            self.assertTrue(backend.should_show("process"))
+            self.assertTrue(backend.should_show("foreground"))
+            self.assertTrue(backend.should_show("visible_window"))
+        finally:
+            overlay.platform.system = original_system
+            overlay.windows_codex_pids = original_pids
+            overlay.windows_foreground_is_codex = original_foreground
+            overlay.windows_has_visible_codex_window = original_visible
+
+        self.assertEqual(calls, ["process", "foreground", "visible_window"])
 
 
 class PositionTests(unittest.TestCase):
@@ -1016,6 +1161,19 @@ class MenuModelTests(unittest.TestCase):
         self.assertIn("Token Counter", detail_labels)
         self.assertIn(app.token_counter.display_text(), detail_labels)
         self.assertIn("API Estimate", detail_labels)
+
+    def test_details_label_preview_model_pricing_as_proxy(self):
+        app = self.make_app(show_api_cost_estimate=True)
+        app.detected_model = overlay.DetectedModel("gpt-5.6-sol", "logs_2.sqlite")
+        app.counter_reset_model = "gpt-5.6-sol"
+        rows = []
+
+        overlay.OverlayApp.add_api_estimate_menu_rows(app, rows)
+        labels = [row.label for row in rows if row.label]
+
+        self.assertIn("$0.00 API est. (GPT-5.5 proxy)", labels)
+        self.assertIn("Detected model: gpt-5.6-sol (logs_2.sqlite)", labels)
+        self.assertIn("Pricing model: GPT-5.5 proxy; tier: Standard (assumed)", labels)
 
     def test_layout_command_changes_mode_on_first_invocation(self):
         app = self.make_app(layout_mode="horizontal")
