@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.7 - 2026-07-09
+
+- Recognize the unified Windows `ChatGPT.exe` host only when it belongs to the
+  `OpenAI.Codex` package.
+- Restore process, foreground, and visible-window modes for the new desktop app.
+- Add exact GPT-5.4 mini API pricing and labeled GPT-5.5 proxy estimates for
+  preview-only Codex models.
+- Include pricing-model and proxy metadata in the runtime state file.
+
 ## 0.1.6 - 2026-07-09
 
 - Keep the context menu within the active monitor's usable work area.
