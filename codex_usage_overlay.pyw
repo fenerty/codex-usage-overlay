@@ -28,7 +28,7 @@ from typing import Any, Callable
 
 
 APP_NAME = "Codex Usage Overlay"
-APP_VERSION = "0.1.5"
+APP_VERSION = "0.1.6"
 SETTINGS_FILE_NAME = "codex_usage_overlay.settings.json"
 RUNTIME_STATE_FILE_NAME = "codex-usage-overlay-state.json"
 INSTANCE_LOCK_FILE_NAME = "codex-usage-overlay.lock"
@@ -77,6 +77,14 @@ MENU_MUTED = "#6b7280"
 MENU_HOVER = "#dbeafe"
 MENU_DISABLED_BG = "#f8fafc"
 MENU_SEPARATOR = "#d1d5db"
+MENU_SCREEN_PADDING = 8
+MENU_ROW_PADX = 8
+MENU_ROW_PADY = 2
+MENU_SEPARATOR_PADY = 2
+MENU_MIN_WRAP_LENGTH = 180
+MENU_MAX_WRAP_LENGTH = 420
+MENU_SCROLLBAR_WIDTH = 16
+MENU_RELATED_POPUP_GAP = 6
 
 MODEL_ASSIGNMENT_RE = re.compile(r'(?:^|[\s{,])model=(?:"([^"]+)"|([^\s},]+))', re.IGNORECASE)
 CONFIG_MODEL_RE = re.compile(r'^\s*model\s*=\s*"([^"]+)"\s*$', re.IGNORECASE | re.MULTILINE)
@@ -961,12 +969,58 @@ def clamp_popup_position(
     window_width, window_height = normalize_window_size(window_size)
     if width <= 0 or height <= 0:
         return [0, 0]
-    max_x = left + max(0, width - window_width)
-    max_y = top + max(0, height - window_height)
+
+    usable_left, usable_top, usable_right, usable_bottom = popup_usable_edges(bounds)
+    available_width = max(1, usable_right - usable_left)
+    available_height = max(1, usable_bottom - usable_top)
+    anchor_x = int(position[0])
+    anchor_y = int(position[1])
+
+    if window_width > available_width:
+        x = usable_left
+    else:
+        space_right = usable_right - anchor_x
+        space_left = anchor_x - usable_left
+        x = anchor_x if window_width <= space_right or space_right >= space_left else anchor_x - window_width
+
+    if window_height > available_height:
+        y = usable_top
+    else:
+        space_below = usable_bottom - anchor_y
+        space_above = anchor_y - usable_top
+        y = anchor_y if window_height <= space_below or space_below >= space_above else anchor_y - window_height
+
+    max_x = usable_right - window_width
+    max_y = usable_bottom - window_height
     return [
-        clamp_int(int(position[0]), left, max_x),
-        clamp_int(int(position[1]), top, max_y),
+        clamp_int(x, usable_left, max_x),
+        clamp_int(y, usable_top, max_y),
     ]
+
+
+def popup_usable_edges(
+    bounds: tuple[int, int, int, int],
+    padding: int = MENU_SCREEN_PADDING,
+) -> tuple[int, int, int, int]:
+    left, top, width, height = bounds
+    if width <= 0 or height <= 0:
+        return (0, 0, 1, 1)
+    horizontal_padding = min(max(0, padding), max(0, (width - 1) // 2))
+    vertical_padding = min(max(0, padding), max(0, (height - 1) // 2))
+    return (
+        left + horizontal_padding,
+        top + vertical_padding,
+        left + width - horizontal_padding,
+        top + height - vertical_padding,
+    )
+
+
+def popup_max_size(bounds: tuple[int, int, int, int]) -> tuple[int, int]:
+    usable_left, usable_top, usable_right, usable_bottom = popup_usable_edges(bounds)
+    return (
+        max(1, usable_right - usable_left),
+        max(1, usable_bottom - usable_top),
+    )
 
 
 def normalize_overlay_position(
@@ -995,6 +1049,42 @@ def windows_virtual_screen_bounds() -> tuple[int, int, int, int] | None:
             int(user32.GetSystemMetrics(79)),
         )
     except (OSError, AttributeError):
+        return None
+
+
+class WindowsMonitorInfo(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.wintypes.DWORD),
+        ("rcMonitor", ctypes.wintypes.RECT),
+        ("rcWork", ctypes.wintypes.RECT),
+        ("dwFlags", ctypes.wintypes.DWORD),
+    ]
+
+
+def windows_monitor_work_area(position: list[int] | tuple[int, int]) -> tuple[int, int, int, int] | None:
+    if platform.system() != "Windows":
+        return None
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.MonitorFromPoint.argtypes = [ctypes.wintypes.POINT, ctypes.wintypes.DWORD]
+        user32.MonitorFromPoint.restype = ctypes.c_void_p
+        user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(WindowsMonitorInfo)]
+        user32.GetMonitorInfoW.restype = ctypes.wintypes.BOOL
+        point = ctypes.wintypes.POINT(int(position[0]), int(position[1]))
+        monitor = user32.MonitorFromPoint(point, 2)
+        if not monitor:
+            return None
+        info = WindowsMonitorInfo()
+        info.cbSize = ctypes.sizeof(WindowsMonitorInfo)
+        if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            return None
+        rect = info.rcWork
+        width = int(rect.right - rect.left)
+        height = int(rect.bottom - rect.top)
+        if width <= 0 or height <= 0:
+            return None
+        return (int(rect.left), int(rect.top), width, height)
+    except (OSError, AttributeError, TypeError, ValueError):
         return None
 
 
@@ -1667,17 +1757,35 @@ class ContextMenuWindow:
         except tk.TclError:
             pass
 
-        self.frame = tk.Frame(self.window, bg=MENU_BG, padx=0, pady=4)
-        self.frame.pack(padx=1, pady=1)
+        self.canvas = tk.Canvas(self.window, bg=MENU_BG, bd=0, highlightthickness=0)
+        self.scrollbar = tk.Scrollbar(self.window, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.frame = tk.Frame(self.canvas, bg=MENU_BG, padx=0, pady=2)
+        self.canvas_window = self.canvas.create_window((0, 0), window=self.frame, anchor="nw")
+        self.canvas.pack(side="left", padx=1, pady=1)
+        self.canvas.bind("<Configure>", self._resize_canvas_window)
+        self.frame.bind("<Configure>", self._update_scroll_region)
         self.closed = False
         self.focus_dismiss_enabled = False
+        self.scrollable = False
+        self.row_labels: list[tk.Label] = []
+        self._bind_scroll_events(self.window)
+        self._bind_scroll_events(self.canvas)
+        self._bind_scroll_events(self.frame)
+        self.window.bind("<Down>", lambda _event: self._scroll_keyboard(3))
+        self.window.bind("<Up>", lambda _event: self._scroll_keyboard(-3))
+        self.window.bind("<Next>", lambda _event: self._scroll_keyboard(8))
+        self.window.bind("<Prior>", lambda _event: self._scroll_keyboard(-8))
+        self.window.bind("<Home>", lambda _event: self._scroll_to_edge(0.0))
+        self.window.bind("<End>", lambda _event: self._scroll_to_edge(1.0))
         self._render_rows()
 
     def _render_rows(self) -> None:
         for row in self.rows:
             if row.kind == "separator":
                 separator = tk.Frame(self.frame, bg=MENU_SEPARATOR, height=1)
-                separator.pack(fill="x", padx=8, pady=4)
+                separator.pack(fill="x", padx=MENU_ROW_PADX, pady=MENU_SEPARATOR_PADY)
+                self._bind_scroll_events(separator)
                 continue
 
             fg = MENU_TEXT if row.clickable else MENU_MUTED
@@ -1689,11 +1797,13 @@ class ContextMenuWindow:
                 font=("Segoe UI", 9),
                 anchor="w",
                 justify="left",
-                padx=10,
-                pady=3,
-                wraplength=460,
+                padx=MENU_ROW_PADX,
+                pady=MENU_ROW_PADY,
+                wraplength=MENU_MAX_WRAP_LENGTH,
             )
             label.pack(fill="x")
+            self.row_labels.append(label)
+            self._bind_scroll_events(label)
             if row.clickable:
                 label.configure(cursor="hand2")
                 label.bind("<Enter>", lambda _event, item=label: item.configure(bg=MENU_HOVER))
@@ -1701,10 +1811,55 @@ class ContextMenuWindow:
                 label.bind("<Button-1>", lambda _event, item=row: self._invoke(item))
 
     def show(self, x: int, y: int) -> None:
+        bounds = self.app.popup_bounds((x, y))
+        max_width, max_height = popup_max_size(bounds)
+        max_canvas_height = max(1, max_height - 2)
+        max_canvas_width = max(1, max_width - 2)
+        self._configure_wrap_length(max_canvas_width)
         self.window.update_idletasks()
-        width = max(1, int(self.window.winfo_width()))
-        height = max(1, int(self.window.winfo_height()))
-        menu_x, menu_y = clamp_popup_position([x, y], self.app.screen_bounds(), (width, height))
+
+        requested_width = max(1, int(self.frame.winfo_reqwidth()))
+        requested_height = max(1, int(self.frame.winfo_reqheight()))
+        scrollable = requested_height > max_canvas_height
+        scrollbar_width = MENU_SCROLLBAR_WIDTH if scrollable else 0
+        canvas_width = min(requested_width, max(1, max_width - scrollbar_width - 2))
+        self._configure_wrap_length(canvas_width)
+        self.canvas.itemconfigure(self.canvas_window, width=canvas_width)
+        self.window.update_idletasks()
+
+        requested_width = max(1, int(self.frame.winfo_reqwidth()))
+        requested_height = max(1, int(self.frame.winfo_reqheight()))
+        self.scrollable = requested_height > max_canvas_height
+        scrollbar_width = MENU_SCROLLBAR_WIDTH if self.scrollable else 0
+        canvas_width = min(requested_width, max(1, max_width - scrollbar_width - 2))
+        self._configure_wrap_length(canvas_width)
+        self.canvas.itemconfigure(self.canvas_window, width=canvas_width)
+        self.window.update_idletasks()
+
+        requested_height = max(1, int(self.frame.winfo_reqheight()))
+        self.scrollable = requested_height > max_canvas_height
+        if self.scrollable and scrollbar_width == 0:
+            canvas_width = min(requested_width, max(1, max_width - MENU_SCROLLBAR_WIDTH - 2))
+            self._configure_wrap_length(canvas_width)
+            self.canvas.itemconfigure(self.canvas_window, width=canvas_width)
+            self.window.update_idletasks()
+            requested_height = max(1, int(self.frame.winfo_reqheight()))
+            self.scrollable = requested_height > max_canvas_height
+        canvas_height = min(requested_height, max_canvas_height)
+        self.canvas.configure(
+            width=canvas_width,
+            height=canvas_height,
+            scrollregion=(0, 0, canvas_width, requested_height),
+        )
+        if self.scrollable:
+            self.scrollbar.pack(side="right", fill="y", padx=(0, 1), pady=1)
+        else:
+            self.scrollbar.pack_forget()
+
+        self.window.update_idletasks()
+        width = max(1, int(self.window.winfo_reqwidth()))
+        height = max(1, int(self.window.winfo_reqheight()))
+        menu_x, menu_y = clamp_popup_position([x, y], bounds, (width, height))
         self.window.geometry(f"+{menu_x}+{menu_y}")
         self.window.deiconify()
         self.window.lift()
@@ -1735,6 +1890,53 @@ class ContextMenuWindow:
             self.window.destroy()
         except tk.TclError:
             pass
+
+    def related_popup_anchor(self) -> tuple[int, int]:
+        try:
+            return (
+                int(self.window.winfo_rootx()) + int(self.window.winfo_width()) + MENU_RELATED_POPUP_GAP,
+                int(self.window.winfo_rooty()),
+            )
+        except tk.TclError:
+            return (0, 0)
+
+    def _configure_wrap_length(self, max_width: int) -> None:
+        wraplength = min(MENU_MAX_WRAP_LENGTH, max(MENU_MIN_WRAP_LENGTH, max_width - 32))
+        for label in self.row_labels:
+            label.configure(wraplength=wraplength)
+
+    def _bind_scroll_events(self, widget: tk.Widget) -> None:
+        widget.bind("<MouseWheel>", self._scroll_mousewheel)
+        widget.bind("<Button-4>", lambda _event: self._scroll_keyboard(-3))
+        widget.bind("<Button-5>", lambda _event: self._scroll_keyboard(3))
+
+    def _resize_canvas_window(self, event: tk.Event) -> None:
+        self.canvas.itemconfigure(self.canvas_window, width=max(1, int(event.width)))
+
+    def _update_scroll_region(self, _event: tk.Event | None = None) -> None:
+        bbox = self.canvas.bbox("all")
+        if bbox is not None:
+            self.canvas.configure(scrollregion=bbox)
+
+    def _scroll_mousewheel(self, event: tk.Event) -> str | None:
+        if not self.scrollable:
+            return None
+        delta = int(getattr(event, "delta", 0))
+        units = -1 if delta > 0 else 1
+        if abs(delta) >= 120:
+            units = -int(delta / 120)
+        self.canvas.yview_scroll(units, "units")
+        return "break"
+
+    def _scroll_keyboard(self, units: int) -> str:
+        if self.scrollable:
+            self.canvas.yview_scroll(units, "units")
+        return "break"
+
+    def _scroll_to_edge(self, fraction: float) -> str:
+        if self.scrollable:
+            self.canvas.yview_moveto(fraction)
+        return "break"
 
     def _enable_focus_dismiss(self) -> None:
         self.focus_dismiss_enabled = True
@@ -1804,6 +2006,7 @@ class OverlayApp:
         self.is_dragging = False
         self.menu_active = False
         self.menu_window: ContextMenuWindow | None = None
+        self.menu_anchor: tuple[int, int] | None = None
         self.needs_render_after_drag = False
         self.needs_render_after_menu = False
         self.needs_visibility_after_menu = False
@@ -1854,6 +2057,9 @@ class OverlayApp:
         if bounds is not None:
             return bounds
         return (0, 0, int(self.root.winfo_screenwidth()), int(self.root.winfo_screenheight()))
+
+    def popup_bounds(self, anchor: tuple[int, int]) -> tuple[int, int, int, int]:
+        return windows_monitor_work_area(anchor) or self.screen_bounds()
 
     def current_window_size(self) -> tuple[int, int]:
         self.root.update_idletasks()
@@ -2029,8 +2235,8 @@ class OverlayApp:
         if self.menu_active:
             self.finish_menu_interaction()
         self.begin_menu_interaction()
-        self.menu_window = ContextMenuWindow(self, self.build_menu_rows())
-        self.menu_window.show(int(event.x_root), int(event.y_root))
+        self.menu_anchor = (int(event.x_root), int(event.y_root))
+        self.replace_menu_window(self.build_menu_rows(), self.menu_anchor)
 
     def begin_menu_interaction(self) -> None:
         self.menu_active = True
@@ -2047,12 +2253,39 @@ class OverlayApp:
         if self.menu_window is not None:
             self.menu_window.close()
             self.menu_window = None
+        self.menu_anchor = None
         self.menu_active = False
         if self.needs_render_after_menu:
             self.request_render(force=True)
         else:
             self.needs_render_after_menu = False
         self.update_visibility(force=True)
+
+    def replace_menu_window(self, rows: list[MenuRow], anchor: tuple[int, int] | None = None) -> None:
+        if anchor is None:
+            anchor = self.current_menu_anchor()
+        if self.menu_window is not None:
+            self.menu_window.close()
+            self.menu_window = None
+        self.menu_anchor = anchor
+        self.menu_window = ContextMenuWindow(self, rows)
+        self.menu_window.show(anchor[0], anchor[1])
+
+    def current_menu_anchor(self) -> tuple[int, int]:
+        if self.menu_window is not None:
+            return self.menu_window.related_popup_anchor()
+        if self.menu_anchor is not None:
+            return self.menu_anchor
+        try:
+            return (int(self.root.winfo_pointerx()), int(self.root.winfo_pointery()))
+        except tk.TclError:
+            return (0, 0)
+
+    def show_detail_menu(self) -> None:
+        self.replace_menu_window(self.build_detail_menu_rows())
+
+    def show_main_menu(self) -> None:
+        self.replace_menu_window(self.build_menu_rows())
 
     def run_menu_command(self, action: Callable[[], None]) -> None:
         try:
@@ -2068,13 +2301,6 @@ class OverlayApp:
         show_token_counter = bool(self.settings.get("show_token_counter", False))
         show_api_cost_estimate = bool(self.settings.get("show_api_cost_estimate", False))
         current_layout = normalize_layout_mode(self.settings.get("layout_mode"))
-
-        rows.append(MenuRow.disabled(self.status_text()))
-        if self.snapshot and self.snapshot.plan_type:
-            rows.append(MenuRow.disabled(f"Plan: {self.snapshot.plan_type}"))
-        if self.snapshot:
-            rows.append(MenuRow.disabled(self.source_status_text()))
-        rows.append(MenuRow.separator())
 
         rows.append(MenuRow.disabled("Visibility"))
         visibility_items = [
@@ -2095,7 +2321,7 @@ class OverlayApp:
             )
 
         rows.append(MenuRow.separator())
-        rows.append(MenuRow.disabled("Rate Windows"))
+        rows.append(MenuRow.disabled("Display"))
         for key in VALID_DISPLAY_WINDOWS:
             rows.append(
                 MenuRow.command(
@@ -2137,9 +2363,31 @@ class OverlayApp:
                 )
             )
 
+        rows.append(MenuRow.separator())
+        rows.append(MenuRow.command("Details...", self.show_detail_menu))
+        rows.append(MenuRow.command("Reset Token Counter", lambda: self.run_menu_command(self.reset_token_counter)))
+
+        rows.append(MenuRow.separator())
+        rows.append(MenuRow.command("Refresh", lambda: self.run_menu_command(self.manual_refresh)))
+        rows.append(MenuRow.command("Reset position", lambda: self.run_menu_command(self.reset_position)))
+        rows.append(MenuRow.command("Quit", lambda: self.run_menu_command(self.quit)))
+        return rows
+
+    def build_detail_menu_rows(self) -> list[MenuRow]:
+        rows: list[MenuRow] = []
+        rows.append(MenuRow.command("Back to menu", self.show_main_menu))
+        rows.append(MenuRow.separator())
+        rows.append(MenuRow.disabled("Status"))
+        rows.append(MenuRow.disabled(self.status_text()))
+        if self.snapshot and self.snapshot.plan_type:
+            rows.append(MenuRow.disabled(f"Plan: {self.snapshot.plan_type}"))
+        if self.snapshot:
+            rows.append(MenuRow.disabled(self.source_status_text()))
+
         if self.snapshot:
             rows.append(MenuRow.separator())
-            for key in normalize_display_windows(self.settings["display_windows"]):
+            rows.append(MenuRow.disabled("Rate Windows"))
+            for key in normalize_display_windows(self.settings.get("display_windows")):
                 rate_window = self.get_window(key)
                 if rate_window:
                     value = (
@@ -2169,14 +2417,8 @@ class OverlayApp:
                 f"Reset {format_snapshot_time(datetime.fromtimestamp(self.token_counter.reset_at, timezone.utc).isoformat())}"
             )
         )
-        rows.append(MenuRow.command("Reset Token Counter", lambda: self.run_menu_command(self.reset_token_counter)))
 
         self.add_api_estimate_menu_rows(rows)
-
-        rows.append(MenuRow.separator())
-        rows.append(MenuRow.command("Refresh", lambda: self.run_menu_command(self.manual_refresh)))
-        rows.append(MenuRow.command("Reset position", lambda: self.run_menu_command(self.reset_position)))
-        rows.append(MenuRow.command("Quit", lambda: self.run_menu_command(self.quit)))
         return rows
 
     def add_api_estimate_menu_rows(self, rows: list[MenuRow]) -> None:

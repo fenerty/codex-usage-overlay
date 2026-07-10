@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.6 - 2026-07-09
+
+- Keep the context menu within the active monitor's usable work area.
+- Add scrolling and adaptive text wrapping for menus on constrained displays.
+- Move status and usage diagnostics into a dedicated Details submenu.
+
 ## 0.1.5 - 2026-06-08
 
 - Replace the native Tk context menu with a custom owned Tk menu window.
