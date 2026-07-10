@@ -786,6 +786,27 @@ class PositionTests(unittest.TestCase):
         self.assertEqual(inside, [-1800, 100])
         self.assertEqual(outside, [-1920, 0])
 
+    def test_popup_near_top_left_uses_screen_padding(self):
+        position = overlay.clamp_popup_position([0, 0], (0, 0, 1920, 1080), (200, 100))
+
+        self.assertEqual(position, [overlay.MENU_SCREEN_PADDING, overlay.MENU_SCREEN_PADDING])
+
+    def test_popup_near_bottom_right_flips_left_and_up(self):
+        position = overlay.clamp_popup_position([1900, 1070], (0, 0, 1920, 1080), (200, 100))
+
+        self.assertEqual(position, [1700, 970])
+
+    def test_popup_supports_negative_monitor_coordinates(self):
+        position = overlay.clamp_popup_position([-20, 100], (-1920, 0, 1920, 1080), (200, 100))
+
+        self.assertEqual(position, [-220, 100])
+
+    def test_oversized_popup_starts_at_usable_top_left(self):
+        position = overlay.clamp_popup_position([250, 180], (0, 0, 300, 200), (500, 300))
+
+        self.assertEqual(position, [overlay.MENU_SCREEN_PADDING, overlay.MENU_SCREEN_PADDING])
+        self.assertEqual(overlay.popup_max_size((0, 0, 300, 200)), (284, 184))
+
 
 class SingleInstanceLockTests(unittest.TestCase):
     def test_lock_blocks_second_live_instance(self):
@@ -972,6 +993,29 @@ class MenuModelTests(unittest.TestCase):
         self.assertIn("[x] Show Token Counter", labels)
         self.assertIn("[ ] Show API Cost Estimate", labels)
         self.assertIn("(*) 2x2 Grid", labels)
+
+    def test_main_menu_keeps_commands_and_moves_diagnostics_to_details(self):
+        app = self.make_app()
+
+        labels = self.labels(app)
+        detail_labels = [
+            row.label for row in overlay.OverlayApp.build_detail_menu_rows(app) if row.label
+        ]
+
+        self.assertIn("Details...", labels)
+        self.assertIn("Reset Token Counter", labels)
+        self.assertIn("Refresh", labels)
+        self.assertIn("Reset position", labels)
+        self.assertIn("Quit", labels)
+        self.assertNotIn("Waiting for Codex rate data", labels)
+        self.assertNotIn("Token Counter", labels)
+        self.assertNotIn("API Estimate", labels)
+
+        self.assertIn("Back to menu", detail_labels)
+        self.assertIn("Waiting for Codex rate data", detail_labels)
+        self.assertIn("Token Counter", detail_labels)
+        self.assertIn(app.token_counter.display_text(), detail_labels)
+        self.assertIn("API Estimate", detail_labels)
 
     def test_layout_command_changes_mode_on_first_invocation(self):
         app = self.make_app(layout_mode="horizontal")
