@@ -158,6 +158,33 @@ class RateParserTests(unittest.TestCase):
         self.assertEqual(snapshot.primary.remaining_percent, 75)
         self.assertIsNone(snapshot.secondary)
 
+    def test_parses_current_single_weekly_window(self):
+        line = token_count_line(
+            "2026-07-13T15:00:00.000Z",
+            primary={"used_percent": 1, "window_minutes": 10080, "resets_at": 1784563200},
+            secondary=None,
+        )
+
+        snapshot = overlay.parse_rate_line(line)
+
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.primary.label, "7d")
+        self.assertEqual(snapshot.primary.remaining_percent, 99)
+        self.assertIsNone(snapshot.secondary)
+
+    def test_uses_generic_label_when_duration_is_unavailable(self):
+        line = token_count_line(
+            "2026-07-13T15:00:00.000Z",
+            primary={"used_percent": 10},
+            secondary=None,
+        )
+
+        snapshot = overlay.parse_rate_line(line)
+
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.primary.label, "limit")
+        self.assertEqual(overlay.long_window_label(snapshot.primary), "Rate limit")
+
     def test_fractional_used_percent_does_not_overstate_remaining(self):
         line = token_count_line(
             "2026-05-30T20:26:33.794Z",
@@ -553,7 +580,25 @@ class TokenCounterTests(unittest.TestCase):
 
         self.assertEqual(counter.reset_at, 2_000)
         self.assertEqual(counter.totals.total_tokens, 0)
+        self.assertEqual(counter.short_context_totals.total_tokens, 0)
+        self.assertEqual(counter.long_context_totals.total_tokens, 0)
+        self.assertEqual(counter.long_context_request_count, 0)
         self.assertEqual(counter.seen_events, set())
+
+    def test_classifies_272000_as_short_and_272001_as_long_context(self):
+        counter = overlay.TokenCounter(reset_at=1_000)
+
+        counter.add_events(
+            [
+                self.event("1970-01-01T00:16:41Z", 272_000, fingerprint="boundary-short"),
+                self.event("1970-01-01T00:16:42Z", 272_001, fingerprint="boundary-long"),
+            ],
+            now=1_003,
+        )
+
+        self.assertEqual(counter.short_context_totals.input_tokens, 272_000)
+        self.assertEqual(counter.long_context_totals.input_tokens, 272_001)
+        self.assertEqual(counter.long_context_request_count, 1)
 
     def test_counts_only_events_after_reset_time(self):
         counter = overlay.TokenCounter(reset_at=1_000)
@@ -702,25 +747,103 @@ class ApiCostEstimateTests(unittest.TestCase):
         self.assertAlmostEqual(estimate.output_cost, 4.50)
         self.assertAlmostEqual(estimate.total_cost, 5.115)
 
-    def test_preview_codex_models_use_labeled_gpt_55_proxy(self):
-        proxy_models = (
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
-            "gpt-5.3-codex-spark",
-        )
+    def test_gpt_56_models_use_exact_published_standard_rates(self):
+        expected = {
+            "gpt-5.6-sol": (5.00, 0.50, 6.25, 30.00, 10.00, 1.00, 12.50, 45.00),
+            "gpt-5.6-terra": (2.50, 0.25, 3.125, 15.00, 5.00, 0.50, 6.25, 22.50),
+            "gpt-5.6-luna": (1.00, 0.10, 1.25, 6.00, 2.00, 0.20, 2.50, 9.00),
+        }
 
-        for model in proxy_models:
+        for model, rates in expected.items():
             with self.subTest(model=model):
-                estimate = overlay.estimate_api_cost(
-                    overlay.TokenUsage(input_tokens=1_000, output_tokens=1_000, total_tokens=2_000),
-                    overlay.DetectedModel(model, "test"),
+                resolution = overlay.resolve_model_pricing(model)
+                self.assertIsNotNone(resolution)
+                self.assertEqual(resolution.pricing_model, model)
+                self.assertFalse(resolution.is_proxy)
+                pricing = resolution.pricing
+                self.assertEqual(
+                    (
+                        pricing.input_per_million,
+                        pricing.cached_input_per_million,
+                        pricing.cache_write_per_million,
+                        pricing.output_per_million,
+                        pricing.long_context_input_per_million,
+                        pricing.long_context_cached_input_per_million,
+                        pricing.long_context_cache_write_per_million,
+                        pricing.long_context_output_per_million,
+                    ),
+                    rates,
+                )
+                self.assertEqual(
+                    pricing.long_context_threshold_tokens,
+                    overlay.LONG_CONTEXT_INPUT_THRESHOLD_TOKENS,
                 )
 
-                self.assertEqual(estimate.pricing_model, "gpt-5.5")
-                self.assertTrue(estimate.pricing_is_proxy)
-                self.assertIsNotNone(estimate.total_cost)
-                self.assertIn("GPT-5.5 proxy", overlay.format_api_cost_estimate(estimate))
+    def test_gpt_56_alias_resolves_to_sol_without_proxy(self):
+        estimate = overlay.estimate_api_cost(
+            overlay.TokenUsage(input_tokens=1_000, output_tokens=1_000, total_tokens=2_000),
+            overlay.DetectedModel("gpt-5.6", "test"),
+        )
+
+        self.assertEqual(overlay.normalize_model_key("gpt-5.6"), "gpt-5.6-sol")
+        self.assertEqual(estimate.pricing_model, "gpt-5.6-sol")
+        self.assertFalse(estimate.pricing_is_proxy)
+
+    def test_only_spark_uses_labeled_gpt_55_proxy(self):
+        estimate = overlay.estimate_api_cost(
+            overlay.TokenUsage(input_tokens=1_000, output_tokens=1_000, total_tokens=2_000),
+            overlay.DetectedModel("gpt-5.3-codex-spark", "test"),
+        )
+
+        self.assertEqual(estimate.pricing_model, "gpt-5.5")
+        self.assertTrue(estimate.pricing_is_proxy)
+        self.assertIn("GPT-5.5 proxy", overlay.format_api_cost_estimate(estimate))
+
+    def test_mixed_context_cost_uses_per_request_rate_buckets(self):
+        short_usage = overlay.TokenUsage(
+            input_tokens=100_000,
+            cached_input_tokens=40_000,
+            output_tokens=10_000,
+            total_tokens=110_000,
+        )
+        long_usage = overlay.TokenUsage(
+            input_tokens=300_000,
+            cached_input_tokens=100_000,
+            output_tokens=20_000,
+            total_tokens=320_000,
+        )
+        total_usage = overlay.add_token_usage(short_usage, long_usage)
+
+        estimate = overlay.estimate_api_cost(
+            total_usage,
+            overlay.DetectedModel("gpt-5.6-sol", "test"),
+            short_context_usage=short_usage,
+            long_context_usage=long_usage,
+            long_context_request_count=1,
+        )
+
+        self.assertAlmostEqual(estimate.input_cost, 2.30)
+        self.assertAlmostEqual(estimate.cached_input_cost, 0.12)
+        self.assertAlmostEqual(estimate.output_cost, 1.20)
+        self.assertAlmostEqual(estimate.total_cost, 3.62)
+        self.assertEqual(estimate.long_context_request_count, 1)
+        self.assertIsNone(estimate.cache_write_cost)
+
+    def test_cached_tokens_are_clamped_within_each_context_bucket(self):
+        short_usage = overlay.TokenUsage(input_tokens=100, cached_input_tokens=200)
+        long_usage = overlay.TokenUsage(input_tokens=300_000, cached_input_tokens=400_000)
+
+        estimate = overlay.estimate_api_cost(
+            overlay.add_token_usage(short_usage, long_usage),
+            overlay.DetectedModel("gpt-5.6-luna", "test"),
+            short_context_usage=short_usage,
+            long_context_usage=long_usage,
+            long_context_request_count=1,
+        )
+
+        self.assertEqual(estimate.uncached_input_tokens, 0)
+        self.assertEqual(estimate.cached_input_tokens, 300_100)
+        self.assertAlmostEqual(estimate.cached_input_cost, 0.06001)
 
     def test_formats_costs(self):
         self.assertEqual(overlay.format_api_cost(0), "$0.00")
@@ -779,6 +902,7 @@ class ModelDetectionTests(unittest.TestCase):
     def test_normalizes_model_aliases(self):
         self.assertEqual(overlay.normalize_model_key("GPT-5.5 Pro"), "gpt-5.5-pro")
         self.assertEqual(overlay.normalize_model_key("gpt_5.4"), "gpt-5.4")
+        self.assertEqual(overlay.normalize_model_key("gpt-5.6"), "gpt-5.6-sol")
 
 
 class RuntimeStateTests(unittest.TestCase):
@@ -811,8 +935,26 @@ class RuntimeStateTests(unittest.TestCase):
             self.assertIn("last_rate_snapshot", state)
             self.assertIn("api_cost_estimate", state)
             self.assertEqual(state["api_cost_estimate"]["model"], "gpt-5.6-sol")
-            self.assertEqual(state["api_cost_estimate"]["pricing_model"], "gpt-5.5")
-            self.assertTrue(state["api_cost_estimate"]["pricing_is_proxy"])
+            self.assertEqual(state["api_cost_estimate"]["pricing_model"], "gpt-5.6-sol")
+            self.assertFalse(state["api_cost_estimate"]["pricing_is_proxy"])
+            self.assertEqual(
+                state["api_cost_estimate"]["pricing"]["long_context_threshold_tokens"],
+                272_000,
+            )
+            self.assertEqual(
+                state["api_cost_estimate"]["pricing"]["cache_write_per_million"],
+                6.25,
+            )
+            self.assertEqual(
+                state["api_cost_estimate"]["pricing"]["long_context_cache_write_per_million"],
+                12.50,
+            )
+            self.assertIsNone(state["api_cost_estimate"]["cache_write_cost"])
+            self.assertFalse(state["api_cost_estimate"]["cache_write_cost_included"])
+            self.assertIn("do not report cache-write tokens", state["api_cost_estimate"]["cache_write_note"])
+            self.assertIn("short_context_totals", state["token_counter"])
+            self.assertIn("long_context_totals", state["token_counter"])
+            self.assertEqual(state["token_counter"]["long_context_request_count"], 0)
             self.assertEqual(state["rate_source"], "logs_2.sqlite")
             self.assertEqual(state["source_event_timestamp"], "2026-06-02T17:20:43+00:00")
             self.assertEqual(state["source_observed_at"], 1780420843)
@@ -1137,7 +1279,10 @@ class MenuModelTests(unittest.TestCase):
         self.assertIn("(*) Always", labels)
         self.assertIn("[x] Show Token Counter", labels)
         self.assertIn("[ ] Show API Cost Estimate", labels)
-        self.assertIn("(*) 2x2 Grid", labels)
+        self.assertIn("(*) Horizontal", labels)
+        self.assertIn("( ) Vertical", labels)
+        self.assertFalse(any("Grid" in label for label in labels))
+        self.assertIn("Rate windows: waiting for data", labels)
 
     def test_main_menu_keeps_commands_and_moves_diagnostics_to_details(self):
         app = self.make_app()
@@ -1162,7 +1307,7 @@ class MenuModelTests(unittest.TestCase):
         self.assertIn(app.token_counter.display_text(), detail_labels)
         self.assertIn("API Estimate", detail_labels)
 
-    def test_details_label_preview_model_pricing_as_proxy(self):
+    def test_details_label_gpt_56_pricing_as_exact(self):
         app = self.make_app(show_api_cost_estimate=True)
         app.detected_model = overlay.DetectedModel("gpt-5.6-sol", "logs_2.sqlite")
         app.counter_reset_model = "gpt-5.6-sol"
@@ -1171,24 +1316,66 @@ class MenuModelTests(unittest.TestCase):
         overlay.OverlayApp.add_api_estimate_menu_rows(app, rows)
         labels = [row.label for row in rows if row.label]
 
-        self.assertIn("$0.00 API est. (GPT-5.5 proxy)", labels)
+        self.assertIn("$0.00 API est.", labels)
         self.assertIn("Detected model: gpt-5.6-sol (logs_2.sqlite)", labels)
-        self.assertIn("Pricing model: GPT-5.5 proxy; tier: Standard (assumed)", labels)
+        self.assertIn("Pricing model: GPT-5.6-SOL; tier: Standard (assumed)", labels)
+        self.assertIn(
+            "Rates /1M (short): input $5.00, cached $0.50, write $6.25, output $30.00",
+            labels,
+        )
+        self.assertIn(
+            "Rates /1M (>272k input): input $10.00, cached $1.00, write $12.50, output $45.00",
+            labels,
+        )
+        self.assertIn(overlay.CACHE_WRITE_TELEMETRY_NOTE, labels)
 
     def test_layout_command_changes_mode_on_first_invocation(self):
         app = self.make_app(layout_mode="horizontal")
         rows = overlay.OverlayApp.build_menu_rows(app)
-        grid_row = next(row for row in rows if row.label == "( ) 2x2 Grid")
+        vertical_row = next(row for row in rows if row.label == "( ) Vertical")
 
-        self.assertTrue(grid_row.invoke())
+        self.assertTrue(vertical_row.invoke())
 
-        self.assertEqual(app.settings["layout_mode"], "grid_2x2")
+        self.assertEqual(app.settings["layout_mode"], "vertical")
         self.assertEqual(app.save_calls, 1)
         self.assertEqual(app.render_calls, 1)
         self.assertFalse(app.menu_active)
 
+    def test_menu_lists_only_available_rate_windows(self):
+        app = self.make_app(layout_mode="horizontal")
+        app.snapshot = overlay.RateSnapshot(
+            timestamp="2026-07-13T15:00:00Z",
+            primary=overlay.RateWindow("7d", 10080, 1.0, 99, 1784563200),
+            secondary=None,
+            plan_type="prolite",
+            rate_limit_reached_type=None,
+        )
+
+        labels = self.labels(app)
+
+        self.assertIn("[x] 7-day limit", labels)
+        self.assertFalse(any("5-hour limit" in label for label in labels))
+        self.assertNotIn("Rate windows: waiting for data", labels)
+
 
 class DisplaySelectionTests(unittest.TestCase):
+    def snapshot(self, primary=True, secondary=True):
+        return overlay.RateSnapshot(
+            timestamp="2026-07-13T15:00:00Z",
+            primary=(
+                overlay.RateWindow("7d", 10080, 1.0, 99, 1784563200)
+                if primary
+                else None
+            ),
+            secondary=(
+                overlay.RateWindow("5h", 300, 10.0, 90, 1784000000)
+                if secondary
+                else None
+            ),
+            plan_type="prolite",
+            rate_limit_reached_type=None,
+        )
+
     def test_primary_only(self):
         self.assertEqual(overlay.normalize_display_windows(["primary"]), ["primary"])
 
@@ -1220,6 +1407,16 @@ class DisplaySelectionTests(unittest.TestCase):
 
         self.assertEqual(settings["layout_mode"], "horizontal")
 
+    def test_legacy_grid_layout_migrates_to_horizontal(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "settings.json"
+            path.write_text(json.dumps({"layout_mode": "grid_2x2"}), encoding="utf-8")
+
+            settings = overlay.load_settings(path)
+
+        self.assertEqual(settings["layout_mode"], "horizontal")
+        self.assertNotIn("grid_2x2", overlay.VALID_LAYOUT_MODES)
+
     def test_layout_positions(self):
         self.assertEqual(
             overlay.layout_positions(4, "horizontal"),
@@ -1229,9 +1426,11 @@ class DisplaySelectionTests(unittest.TestCase):
             overlay.layout_positions(4, "vertical"),
             [(0, 0), (1, 0), (2, 0), (3, 0)],
         )
+        self.assertEqual(overlay.layout_positions(3, "horizontal"), [(0, 0), (0, 1), (0, 2)])
+        self.assertEqual(overlay.layout_positions(3, "vertical"), [(0, 0), (1, 0), (2, 0)])
         self.assertEqual(
             overlay.layout_positions(4, "grid_2x2"),
-            [(0, 0), (0, 1), (1, 0), (1, 1)],
+            [(0, 0), (0, 1), (0, 2), (0, 3)],
         )
 
     def test_display_widget_ordering(self):
@@ -1242,14 +1441,42 @@ class DisplaySelectionTests(unittest.TestCase):
         }
 
         self.assertEqual(
-            overlay.active_display_widget_keys(settings),
+            overlay.active_display_widget_keys(settings, self.snapshot()),
             ["primary", "secondary", "token_counter", "api_cost"],
         )
 
         settings["display_windows"] = ["secondary"]
         settings["show_token_counter"] = False
 
-        self.assertEqual(overlay.active_display_widget_keys(settings), ["secondary", "api_cost"])
+        self.assertEqual(
+            overlay.active_display_widget_keys(settings, self.snapshot()),
+            ["secondary", "api_cost"],
+        )
+
+    def test_stale_saved_window_selection_falls_back_to_available_window(self):
+        settings = {
+            "display_windows": ["secondary"],
+            "show_token_counter": False,
+            "show_api_cost_estimate": False,
+        }
+
+        self.assertEqual(
+            overlay.effective_display_windows(settings, self.snapshot(primary=True, secondary=False)),
+            ["primary"],
+        )
+        self.assertEqual(
+            overlay.active_display_widget_keys(settings, self.snapshot(primary=True, secondary=False)),
+            ["primary"],
+        )
+
+    def test_no_rate_data_has_one_waiting_widget_key(self):
+        settings = {
+            "display_windows": ["primary", "secondary"],
+            "show_token_counter": False,
+            "show_api_cost_estimate": False,
+        }
+
+        self.assertEqual(overlay.active_display_widget_keys(settings, None), ["rate_waiting"])
 
     def test_reset_countdown_formats_minutes_hours_and_days(self):
         now = 1_000
@@ -1266,6 +1493,84 @@ class DisplaySelectionTests(unittest.TestCase):
         now = 1_000
 
         self.assertEqual(overlay.format_reset_countdown(now - 61, now=now), "pending")
+
+
+class DisplayWidgetTests(unittest.TestCase):
+    def make_app(self, snapshot, display_windows=None, show_resets=False):
+        app = object.__new__(overlay.OverlayApp)
+        app.settings = {
+            "display_windows": display_windows or ["primary", "secondary"],
+            "show_resets": show_resets,
+            "show_token_counter": False,
+            "show_api_cost_estimate": False,
+        }
+        app.snapshot = snapshot
+        app.token_counter = overlay.TokenCounter(reset_at=1_000)
+        app.detected_model = overlay.DetectedModel("gpt-5.6-sol", "test")
+        app.counter_reset_model = "gpt-5.6-sol"
+        return app
+
+    def snapshot(self, primary=None, secondary=None):
+        return overlay.RateSnapshot(
+            timestamp="2026-07-13T15:00:00Z",
+            primary=primary,
+            secondary=secondary,
+            plan_type="prolite",
+            rate_limit_reached_type=None,
+        )
+
+    def test_current_single_weekly_window_never_renders_duplicate_placeholder(self):
+        snapshot = self.snapshot(
+            primary=overlay.RateWindow("7d", 10080, 1.0, 99, 1784563200),
+            secondary=None,
+        )
+
+        widgets = overlay.OverlayApp.display_widgets(self.make_app(snapshot))
+
+        self.assertEqual([(widget.key, widget.text) for widget in widgets], [("primary", "7d 99%")])
+        self.assertFalse(any("--" in widget.text for widget in widgets))
+
+    def test_legacy_five_hour_and_weekly_windows_render_both(self):
+        snapshot = self.snapshot(
+            primary=overlay.RateWindow("5h", 300, 10.0, 90, 1784000000),
+            secondary=overlay.RateWindow("7d", 10080, 20.0, 80, 1784563200),
+        )
+
+        widgets = overlay.OverlayApp.display_widgets(self.make_app(snapshot))
+
+        self.assertEqual(
+            [(widget.key, widget.text) for widget in widgets],
+            [("primary", "5h 90%"), ("secondary", "7d 80%")],
+        )
+
+    def test_stale_missing_slot_selection_renders_available_window(self):
+        snapshot = self.snapshot(
+            primary=overlay.RateWindow("7d", 10080, 1.0, 99, 1784563200),
+            secondary=None,
+        )
+
+        widgets = overlay.OverlayApp.display_widgets(
+            self.make_app(snapshot, display_windows=["secondary"])
+        )
+
+        self.assertEqual([(widget.key, widget.text) for widget in widgets], [("primary", "7d 99%")])
+
+    def test_no_rate_data_renders_one_waiting_message(self):
+        widgets = overlay.OverlayApp.display_widgets(self.make_app(None))
+
+        self.assertEqual(len(widgets), 1)
+        self.assertEqual(widgets[0].key, "rate_waiting")
+        self.assertEqual(widgets[0].text, "Waiting for Codex rate data")
+
+    def test_available_window_without_percentage_uses_telemetry_label(self):
+        snapshot = self.snapshot(
+            primary=overlay.RateWindow("limit", None, None, None, None),
+            secondary=None,
+        )
+
+        widgets = overlay.OverlayApp.display_widgets(self.make_app(snapshot, show_resets=True))
+
+        self.assertEqual(widgets[0].text, "limit -- reset --")
 
 
 if __name__ == "__main__":

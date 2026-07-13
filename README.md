@@ -13,14 +13,16 @@ This is an independent utility and is not an official OpenAI or Codex project.
 ## Features
 
 - Always-on-top, draggable, translucent Tkinter overlay.
-- Shows Codex-reported 5-hour and 7-day remaining percentages.
+- Shows whichever Codex rate-limit windows are present in local telemetry. Current
+  one-window telemetry renders one widget; legacy 5-hour plus weekly telemetry
+  still renders both windows.
 - Uses the freshest local source available: `logs_2.sqlite` rate-limit websocket
   events first, session JSONL rate events as fallback.
 - Optional reset countdowns in the overlay.
 - Optional manual token counter with input, cached input, output, reasoning, and
   total token details.
 - Optional API-equivalent cost estimate using local token counts and documented
-  OpenAI API pricing constants.
+  OpenAI Standard API pricing, including per-request long-context premiums.
 - Right-click menu for visibility modes, display toggles, layout, refresh, reset
   position, token-counter reset, and status details.
 - Package-aware Windows visibility for both legacy `codex.exe` and the unified
@@ -91,8 +93,11 @@ coordinates and personal preferences. Use
 Supported settings include:
 
 - `visibility_mode`: `always`, `process`, `foreground`, or `visible_window`
-- `display_windows`: `primary`, `secondary`, or both
-- `layout_mode`: `horizontal`, `vertical`, or `grid_2x2`
+- `display_windows`: `primary`, `secondary`, or both. Only slots present in the
+  latest telemetry are offered or rendered; a stale missing-slot selection falls
+  back to the available window.
+- `layout_mode`: `horizontal` or `vertical`. Legacy `grid_2x2` values migrate to
+  `horizontal` the next time settings are saved.
 - `position`: saved overlay coordinates
 - `opacity`: `0.2` through `1.0`
 - `show_resets`: show reset countdowns
@@ -117,8 +122,12 @@ normal quit.
 - Displayed rate limits are only as fresh as the local Codex logs.
 - The API cost estimate is approximate and is not actual Codex subscription
   billing.
-- Preview-only Codex models without published API pricing use a clearly labeled
-  GPT-5.5 proxy. Unknown, custom, and future models remain unpriced.
+- GPT-5.6 Sol, Terra, and Luna use their published short- and long-context
+  Standard API prices. The unpublished GPT-5.3-Codex-Spark preview uses a clearly
+  labeled GPT-5.5 proxy. Unknown, custom, and future models remain unpriced.
+- GPT-5.6 pricing publishes cache-write premiums, but local Codex events do not
+  report cache-write token counts. Those rates are exposed as metadata while
+  cache-write costs are excluded from the estimate total.
 - If models change during a manual token-counter window, reset the counter for a
   cleaner cost estimate.
 
@@ -130,7 +139,7 @@ The overlay saves its last screen position in `codex_usage_overlay.settings.json
 If your monitor layout changed, delete the `position` value or set it to `null`.
 The app also clamps saved positions to the visible screen area on launch.
 
-For the unified Windows desktop app, use version `0.1.7` or newer so the
+For the unified Windows desktop app, use version `0.1.8` or newer so the
 `foreground` and `visible_window` modes recognize the packaged `ChatGPT.exe`
 host. Other ChatGPT installations are intentionally ignored.
 

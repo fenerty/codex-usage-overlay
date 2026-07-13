@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.8 - 2026-07-13
+
+- Replace GPT-5.6 proxy estimates with published Sol, Terra, and Luna Standard
+  API prices, including per-request long-context pricing above 272,000 input
+  tokens.
+- Expose cache-write rates as metadata while excluding cache-write premiums from
+  totals because local Codex events do not report cache-write token counts.
+- Render only rate windows present in telemetry, including the current single
+  weekly-window shape, while retaining legacy 5-hour plus weekly parsing.
+- Replace missing-window placeholders with one waiting state when no rate data is
+  available.
+- Remove the 2x2 grid layout and migrate saved grid settings to horizontal.
+
 ## 0.1.7 - 2026-07-09
 
 - Recognize the unified Windows `ChatGPT.exe` host only when it belongs to the
