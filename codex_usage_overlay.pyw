@@ -28,14 +28,14 @@ from typing import Any, Callable
 
 
 APP_NAME = "Codex Usage Overlay"
-APP_VERSION = "0.1.7"
+APP_VERSION = "0.1.8"
 SETTINGS_FILE_NAME = "codex_usage_overlay.settings.json"
 RUNTIME_STATE_FILE_NAME = "codex-usage-overlay-state.json"
 INSTANCE_LOCK_FILE_NAME = "codex-usage-overlay.lock"
 DEFAULT_DISPLAY_WINDOWS = ("primary", "secondary")
 VALID_DISPLAY_WINDOWS = ("primary", "secondary")
 DEFAULT_LAYOUT_MODE = "horizontal"
-VALID_LAYOUT_MODES = ("horizontal", "vertical", "grid_2x2")
+VALID_LAYOUT_MODES = ("horizontal", "vertical")
 VALID_VISIBILITY_MODES = ("always", "process", "foreground", "visible_window")
 CODEX_PROCESS_NAMES = {"codex.exe"}
 GENERIC_CODEX_PROCESS_NAMES = {"codex", "codex.exe"}
@@ -55,9 +55,11 @@ MODEL_DETECT_INTERVAL_SECONDS = 10
 MODEL_LOG_ROWS_TO_SCAN = 250
 SQLITE_RATE_ROWS_TO_SCAN = 200
 API_PRICING_ASSUMPTION = "Standard API pricing assumed"
-API_PRICING_SOURCE_URL = "https://developers.openai.com/api/docs/models/compare"
-GPT_55_PRICING_SOURCE_URL = "https://developers.openai.com/api/docs/models/gpt-5.5"
-GPT_54_MINI_PRICING_SOURCE_URL = "https://developers.openai.com/api/docs/models/gpt-5.4-mini"
+API_PRICING_SOURCE_URL = "https://developers.openai.com/api/docs/pricing"
+LONG_CONTEXT_INPUT_THRESHOLD_TOKENS = 272_000
+CACHE_WRITE_TELEMETRY_NOTE = (
+    "Local Codex events do not report cache-write tokens; cache-write premiums are excluded."
+)
 TOKEN_USAGE_KEYS = (
     "input_tokens",
     "cached_input_tokens",
@@ -137,6 +139,12 @@ class ModelPricing:
     cached_input_per_million: float | None
     output_per_million: float
     source_url: str
+    cache_write_per_million: float | None = None
+    long_context_threshold_tokens: int | None = None
+    long_context_input_per_million: float | None = None
+    long_context_cached_input_per_million: float | None = None
+    long_context_cache_write_per_million: float | None = None
+    long_context_output_per_million: float | None = None
 
 
 @dataclass(frozen=True)
@@ -166,6 +174,8 @@ class ApiCostEstimate:
     cached_input_cost: float | None
     output_cost: float | None
     total_cost: float | None
+    long_context_request_count: int = 0
+    cache_write_cost: float | None = None
     warning: str | None = None
 
 
@@ -221,21 +231,61 @@ class LogReadBatch:
     token_events: list[TokenEvent]
 
 
-# Current official OpenAI API prices, per 1M text tokens.
-# Sources:
-# - https://developers.openai.com/api/docs/models/gpt-5.5
-# - https://developers.openai.com/api/docs/models/gpt-5.4-mini
-# - https://developers.openai.com/api/docs/models/compare
+# Current official OpenAI Standard API prices, per 1M text tokens.
+# Source: https://developers.openai.com/api/docs/pricing
 API_MODEL_PRICING = {
-    "gpt-5.5": ModelPricing("gpt-5.5", 5.00, 0.50, 30.00, GPT_55_PRICING_SOURCE_URL),
-    "gpt-5.5-pro": ModelPricing("gpt-5.5 pro", 30.00, None, 180.00, API_PRICING_SOURCE_URL),
-    "gpt-5.4": ModelPricing("gpt-5.4", 2.50, 0.25, 15.00, API_PRICING_SOURCE_URL),
-    "gpt-5.4-mini": ModelPricing("gpt-5.4 mini", 0.75, 0.075, 4.50, GPT_54_MINI_PRICING_SOURCE_URL),
+    "gpt-5.6-sol": ModelPricing(
+        "gpt-5.6 Sol", 5.00, 0.50, 30.00, API_PRICING_SOURCE_URL,
+        cache_write_per_million=6.25,
+        long_context_threshold_tokens=LONG_CONTEXT_INPUT_THRESHOLD_TOKENS,
+        long_context_input_per_million=10.00,
+        long_context_cached_input_per_million=1.00,
+        long_context_cache_write_per_million=12.50,
+        long_context_output_per_million=45.00,
+    ),
+    "gpt-5.6-terra": ModelPricing(
+        "gpt-5.6 Terra", 2.50, 0.25, 15.00, API_PRICING_SOURCE_URL,
+        cache_write_per_million=3.125,
+        long_context_threshold_tokens=LONG_CONTEXT_INPUT_THRESHOLD_TOKENS,
+        long_context_input_per_million=5.00,
+        long_context_cached_input_per_million=0.50,
+        long_context_cache_write_per_million=6.25,
+        long_context_output_per_million=22.50,
+    ),
+    "gpt-5.6-luna": ModelPricing(
+        "gpt-5.6 Luna", 1.00, 0.10, 6.00, API_PRICING_SOURCE_URL,
+        cache_write_per_million=1.25,
+        long_context_threshold_tokens=LONG_CONTEXT_INPUT_THRESHOLD_TOKENS,
+        long_context_input_per_million=2.00,
+        long_context_cached_input_per_million=0.20,
+        long_context_cache_write_per_million=2.50,
+        long_context_output_per_million=9.00,
+    ),
+    "gpt-5.5": ModelPricing(
+        "gpt-5.5", 5.00, 0.50, 30.00, API_PRICING_SOURCE_URL,
+        long_context_threshold_tokens=LONG_CONTEXT_INPUT_THRESHOLD_TOKENS,
+        long_context_input_per_million=10.00,
+        long_context_cached_input_per_million=1.00,
+        long_context_output_per_million=45.00,
+    ),
+    "gpt-5.5-pro": ModelPricing(
+        "gpt-5.5 pro", 30.00, None, 180.00, API_PRICING_SOURCE_URL,
+        long_context_threshold_tokens=LONG_CONTEXT_INPUT_THRESHOLD_TOKENS,
+        long_context_input_per_million=60.00,
+        long_context_output_per_million=270.00,
+    ),
+    "gpt-5.4": ModelPricing(
+        "gpt-5.4", 2.50, 0.25, 15.00, API_PRICING_SOURCE_URL,
+        long_context_threshold_tokens=LONG_CONTEXT_INPUT_THRESHOLD_TOKENS,
+        long_context_input_per_million=5.00,
+        long_context_cached_input_per_million=0.50,
+        long_context_output_per_million=22.50,
+    ),
+    "gpt-5.4-mini": ModelPricing(
+        "gpt-5.4 mini", 0.75, 0.075, 4.50, API_PRICING_SOURCE_URL
+    ),
 }
 API_PRICING_PROXY_MODELS = {
-    "gpt-5.6-sol": "gpt-5.5",
-    "gpt-5.6-terra": "gpt-5.5",
-    "gpt-5.6-luna": "gpt-5.5",
     "gpt-5.3-codex-spark": "gpt-5.5",
 }
 
@@ -271,22 +321,20 @@ def window_label(window_minutes: Any, fallback: str) -> str:
     return f"{minutes}m"
 
 
-def long_window_label(key: str, rate_window: RateWindow | None) -> str:
-    label = rate_window.label if rate_window else default_window_label(key)
+def long_window_label(rate_window: RateWindow) -> str:
+    label = rate_window.label
     if label.endswith("h"):
         return f"{label[:-1]}-hour limit"
     if label.endswith("d"):
         return f"{label[:-1]}-day limit"
     if label.endswith("m"):
         return f"{label[:-1]}-minute limit"
+    if label.lower() in {"limit", "rate limit"}:
+        return "Rate limit"
     return f"{label} limit"
 
 
-def default_window_label(key: str) -> str:
-    return "5h" if key == "primary" else "7d"
-
-
-def parse_rate_window(raw: Any, fallback_label: str) -> RateWindow | None:
+def parse_rate_window(raw: Any, fallback_label: str = "limit") -> RateWindow | None:
     if not isinstance(raw, dict):
         return None
 
@@ -342,8 +390,8 @@ def parse_rate_line(
     if not isinstance(rate_limits, dict):
         return None
 
-    primary = parse_rate_window(rate_limits.get("primary"), "5h")
-    secondary = parse_rate_window(rate_limits.get("secondary"), "7d")
+    primary = parse_rate_window(rate_limits.get("primary"))
+    secondary = parse_rate_window(rate_limits.get("secondary"))
     if primary is None and secondary is None:
         return None
 
@@ -400,6 +448,8 @@ def normalize_model_key(model: str | None) -> str | None:
     normalized = model.strip().lower().replace("_", "-").replace(" ", "-")
     if normalized in {"gpt-5.5-pro", "gpt-5.5pro"}:
         return "gpt-5.5-pro"
+    if normalized == "gpt-5.6":
+        return "gpt-5.6-sol"
     return normalized
 
 
@@ -488,10 +538,33 @@ def estimate_api_cost(
     usage: TokenUsage,
     detected_model: DetectedModel,
     reset_model: str | None = None,
+    short_context_usage: TokenUsage | None = None,
+    long_context_usage: TokenUsage | None = None,
+    long_context_request_count: int = 0,
 ) -> ApiCostEstimate:
-    cached_input_tokens = min(usage.cached_input_tokens, usage.input_tokens)
-    uncached_input_tokens = max(0, usage.input_tokens - cached_input_tokens)
-    output_tokens = usage.output_tokens
+    if short_context_usage is None and long_context_usage is None:
+        short_context_usage = usage
+        long_context_usage = TokenUsage()
+    else:
+        short_context_usage = short_context_usage or TokenUsage()
+        long_context_usage = long_context_usage or TokenUsage()
+
+    short_cached_tokens = min(
+        short_context_usage.cached_input_tokens,
+        short_context_usage.input_tokens,
+    )
+    long_cached_tokens = min(
+        long_context_usage.cached_input_tokens,
+        long_context_usage.input_tokens,
+    )
+    cached_input_tokens = short_cached_tokens + long_cached_tokens
+    uncached_input_tokens = (
+        short_context_usage.input_tokens
+        - short_cached_tokens
+        + long_context_usage.input_tokens
+        - long_cached_tokens
+    )
+    output_tokens = short_context_usage.output_tokens + long_context_usage.output_tokens
     pricing_resolution = resolve_model_pricing(detected_model.model)
     pricing = pricing_resolution.pricing if pricing_resolution else None
 
@@ -517,16 +590,38 @@ def estimate_api_cost(
             cached_input_cost=None,
             output_cost=None,
             total_cost=None,
+            long_context_request_count=long_context_request_count,
             warning=warning,
         )
 
-    cached_rate = pricing.cached_input_per_million
-    if cached_rate is None:
-        cached_rate = pricing.input_per_million
+    short_cached_rate = pricing.cached_input_per_million
+    if short_cached_rate is None:
+        short_cached_rate = pricing.input_per_million
 
-    input_cost = uncached_input_tokens * pricing.input_per_million / 1_000_000
-    cached_input_cost = cached_input_tokens * cached_rate / 1_000_000
-    output_cost = output_tokens * pricing.output_per_million / 1_000_000
+    long_input_rate = pricing.long_context_input_per_million
+    if long_input_rate is None:
+        long_input_rate = pricing.input_per_million
+    long_cached_rate = pricing.long_context_cached_input_per_million
+    if long_cached_rate is None:
+        long_cached_rate = long_input_rate
+    long_output_rate = pricing.long_context_output_per_million
+    if long_output_rate is None:
+        long_output_rate = pricing.output_per_million
+
+    short_uncached_tokens = short_context_usage.input_tokens - short_cached_tokens
+    long_uncached_tokens = long_context_usage.input_tokens - long_cached_tokens
+    input_cost = (
+        short_uncached_tokens * pricing.input_per_million
+        + long_uncached_tokens * long_input_rate
+    ) / 1_000_000
+    cached_input_cost = (
+        short_cached_tokens * short_cached_rate
+        + long_cached_tokens * long_cached_rate
+    ) / 1_000_000
+    output_cost = (
+        short_context_usage.output_tokens * pricing.output_per_million
+        + long_context_usage.output_tokens * long_output_rate
+    ) / 1_000_000
     return ApiCostEstimate(
         model=detected_model.model,
         model_source=detected_model.source,
@@ -540,6 +635,7 @@ def estimate_api_cost(
         cached_input_cost=cached_input_cost,
         output_cost=output_cost,
         total_cost=input_cost + cached_input_cost + output_cost,
+        long_context_request_count=long_context_request_count,
         warning=warning,
     )
 
@@ -557,6 +653,12 @@ def format_api_cost(value: float | None) -> str:
 def format_api_rate(value: float | None) -> str:
     if value is None:
         return "same as input"
+    return format_api_cost(value)
+
+
+def format_published_api_rate(value: float | None) -> str:
+    if value is None:
+        return "--"
     return format_api_cost(value)
 
 
@@ -583,7 +685,13 @@ def model_pricing_to_dict(pricing: ModelPricing | None) -> dict[str, Any] | None
         "display_name": pricing.display_name,
         "input_per_million": pricing.input_per_million,
         "cached_input_per_million": pricing.cached_input_per_million,
+        "cache_write_per_million": pricing.cache_write_per_million,
         "output_per_million": pricing.output_per_million,
+        "long_context_threshold_tokens": pricing.long_context_threshold_tokens,
+        "long_context_input_per_million": pricing.long_context_input_per_million,
+        "long_context_cached_input_per_million": pricing.long_context_cached_input_per_million,
+        "long_context_cache_write_per_million": pricing.long_context_cache_write_per_million,
+        "long_context_output_per_million": pricing.long_context_output_per_million,
         "source_url": pricing.source_url,
         "assumption": API_PRICING_ASSUMPTION,
     }
@@ -604,6 +712,10 @@ def api_cost_estimate_to_dict(estimate: ApiCostEstimate | None) -> dict[str, Any
         "input_cost": estimate.input_cost,
         "cached_input_cost": estimate.cached_input_cost,
         "output_cost": estimate.output_cost,
+        "long_context_request_count": estimate.long_context_request_count,
+        "cache_write_cost": estimate.cache_write_cost,
+        "cache_write_cost_included": False,
+        "cache_write_note": CACHE_WRITE_TELEMETRY_NOTE,
         "total_cost": estimate.total_cost,
         "display": format_api_cost_estimate(estimate),
         "warning": estimate.warning,
@@ -715,8 +827,8 @@ def parse_sqlite_rate_limit_log_body(
     if not isinstance(rate_limits, dict):
         return None
 
-    primary = parse_rate_window(rate_limits.get("primary"), "5h")
-    secondary = parse_rate_window(rate_limits.get("secondary"), "7d")
+    primary = parse_rate_window(rate_limits.get("primary"))
+    secondary = parse_rate_window(rate_limits.get("secondary"))
     if primary is None and secondary is None:
         return None
 
@@ -925,8 +1037,29 @@ def normalize_layout_mode(value: Any) -> str:
     return value if value in VALID_LAYOUT_MODES else DEFAULT_LAYOUT_MODE
 
 
-def active_display_widget_keys(settings: dict[str, Any]) -> list[str]:
-    keys = list(normalize_display_windows(settings.get("display_windows")))
+def available_rate_window_keys(snapshot: RateSnapshot | None) -> list[str]:
+    if snapshot is None:
+        return []
+    return [key for key in VALID_DISPLAY_WINDOWS if getattr(snapshot, key) is not None]
+
+
+def effective_display_windows(
+    settings: dict[str, Any],
+    snapshot: RateSnapshot | None,
+) -> list[str]:
+    available = available_rate_window_keys(snapshot)
+    if not available:
+        return []
+    selected = normalize_display_windows(settings.get("display_windows"))
+    visible = [key for key in selected if key in available]
+    return visible or available
+
+
+def active_display_widget_keys(
+    settings: dict[str, Any],
+    snapshot: RateSnapshot | None = None,
+) -> list[str]:
+    keys = effective_display_windows(settings, snapshot) or ["rate_waiting"]
     if settings.get("show_token_counter", False):
         keys.append("token_counter")
     if settings.get("show_api_cost_estimate", False):
@@ -938,8 +1071,6 @@ def layout_position(index: int, layout_mode: str) -> tuple[int, int]:
     mode = normalize_layout_mode(layout_mode)
     if mode == "vertical":
         return (index, 0)
-    if mode == "grid_2x2":
-        return (index // 2, index % 2)
     return (0, index)
 
 
@@ -1337,6 +1468,9 @@ class TokenCounter:
     def __init__(self, reset_at: float | None = None) -> None:
         self.reset_at = time.time() if reset_at is None else reset_at
         self.totals = TokenUsage()
+        self.short_context_totals = TokenUsage()
+        self.long_context_totals = TokenUsage()
+        self.long_context_request_count = 0
         self.seen_events: set[str] = set()
         self.last_update_at: float | None = None
 
@@ -1351,12 +1485,20 @@ class TokenCounter:
                 continue
 
             self.totals = add_token_usage(self.totals, event.usage)
+            if event.usage.input_tokens > LONG_CONTEXT_INPUT_THRESHOLD_TOKENS:
+                self.long_context_totals = add_token_usage(self.long_context_totals, event.usage)
+                self.long_context_request_count += 1
+            else:
+                self.short_context_totals = add_token_usage(self.short_context_totals, event.usage)
             self.seen_events.add(event.fingerprint)
             self.last_update_at = current
 
     def reset(self, now: float | None = None) -> None:
         self.reset_at = time.time() if now is None else now
         self.totals = TokenUsage()
+        self.short_context_totals = TokenUsage()
+        self.long_context_totals = TokenUsage()
+        self.long_context_request_count = 0
         self.seen_events.clear()
         self.last_update_at = None
 
@@ -1368,6 +1510,9 @@ class TokenCounter:
             "reset_at": self.reset_at,
             "last_update_at": self.last_update_at,
             "totals": token_usage_to_dict(self.totals),
+            "short_context_totals": token_usage_to_dict(self.short_context_totals),
+            "long_context_totals": token_usage_to_dict(self.long_context_totals),
+            "long_context_request_count": self.long_context_request_count,
             "seen_event_count": len(self.seen_events),
         }
 
@@ -2236,7 +2381,14 @@ class OverlayApp:
         self.last_model_check_at = now
 
     def current_api_cost_estimate(self) -> ApiCostEstimate:
-        return estimate_api_cost(self.token_counter.totals, self.detected_model, self.counter_reset_model)
+        return estimate_api_cost(
+            self.token_counter.totals,
+            self.detected_model,
+            self.counter_reset_model,
+            short_context_usage=self.token_counter.short_context_totals,
+            long_context_usage=self.token_counter.long_context_totals,
+            long_context_request_count=self.token_counter.long_context_request_count,
+        )
 
     def request_render(self, force: bool = False) -> None:
         if not force and self.menu_active:
@@ -2273,23 +2425,26 @@ class OverlayApp:
 
     def display_widgets(self) -> list[DisplayWidget]:
         widgets: list[DisplayWidget] = []
-        selected = normalize_display_windows(self.settings.get("display_windows"))
+        selected = effective_display_windows(self.settings, self.snapshot)
         show_resets = bool(self.settings.get("show_resets", False))
+        if not selected:
+            widgets.append(DisplayWidget("rate_waiting", "Waiting for Codex rate data", COLOR_MUTED))
         for key in selected:
             rate_window = self.get_window(key)
-            if rate_window is None or rate_window.remaining_percent is None:
-                text = f"{default_window_label(key)} --"
-                if show_resets:
-                    text += " reset --"
-                widgets.append(DisplayWidget(key, text, COLOR_MUTED))
-            else:
-                widgets.append(
-                    DisplayWidget(
-                        key,
-                        self.format_window_text(rate_window, show_resets),
-                        percent_color(rate_window.remaining_percent),
-                    )
+            if rate_window is None:
+                continue
+            color = (
+                COLOR_MUTED
+                if rate_window.remaining_percent is None
+                else percent_color(rate_window.remaining_percent)
+            )
+            widgets.append(
+                DisplayWidget(
+                    key,
+                    self.format_window_text(rate_window, show_resets),
+                    color,
                 )
+            )
 
         if self.snapshot and self.snapshot.rate_limit_reached_type:
             if widgets:
@@ -2306,10 +2461,11 @@ class OverlayApp:
             color = COLOR_MUTED if estimate.total_cost is None else COLOR_TEXT
             widgets.append(DisplayWidget("api_cost", format_api_cost_estimate(estimate), color))
 
-        return widgets or [DisplayWidget("empty", "5h --  7d --", COLOR_MUTED)]
+        return widgets
 
     def format_window_text(self, rate_window: RateWindow, show_resets: bool) -> str:
-        text = f"{rate_window.label} {rate_window.remaining_percent}%"
+        remaining = "--" if rate_window.remaining_percent is None else f"{rate_window.remaining_percent}%"
+        text = f"{rate_window.label} {remaining}"
         if show_resets:
             text += f" reset {format_reset_countdown(rate_window.resets_at)}"
         return text
@@ -2399,7 +2555,8 @@ class OverlayApp:
     def build_menu_rows(self) -> list[MenuRow]:
         rows: list[MenuRow] = []
         current_visibility = normalize_visibility_mode(self.settings.get("visibility_mode"))
-        current_windows = set(normalize_display_windows(self.settings.get("display_windows")))
+        available_windows = available_rate_window_keys(self.snapshot)
+        current_windows = set(effective_display_windows(self.settings, self.snapshot))
         show_resets = bool(self.settings.get("show_resets", False))
         show_token_counter = bool(self.settings.get("show_token_counter", False))
         show_api_cost_estimate = bool(self.settings.get("show_api_cost_estimate", False))
@@ -2425,13 +2582,21 @@ class OverlayApp:
 
         rows.append(MenuRow.separator())
         rows.append(MenuRow.disabled("Display"))
-        for key in VALID_DISPLAY_WINDOWS:
-            rows.append(
-                MenuRow.command(
-                    checked_menu_label(long_window_label(key, self.get_window(key)), key in current_windows),
-                    lambda selected=key: self.run_menu_command(lambda: self.toggle_display_window(selected)),
+        if not available_windows:
+            rows.append(MenuRow.disabled("Rate windows: waiting for data"))
+        else:
+            for key in available_windows:
+                rate_window = self.get_window(key)
+                if rate_window is None:
+                    continue
+                rows.append(
+                    MenuRow.command(
+                        checked_menu_label(long_window_label(rate_window), key in current_windows),
+                        lambda selected=key: self.run_menu_command(
+                            lambda: self.toggle_display_window(selected)
+                        ),
+                    )
                 )
-            )
         rows.append(
             MenuRow.command(
                 checked_menu_label("Show Reset Countdown", show_resets),
@@ -2456,7 +2621,6 @@ class OverlayApp:
         layout_items = [
             ("Horizontal", "horizontal"),
             ("Vertical", "vertical"),
-            ("2x2 Grid", "grid_2x2"),
         ]
         for label, mode in layout_items:
             rows.append(
@@ -2490,7 +2654,7 @@ class OverlayApp:
         if self.snapshot:
             rows.append(MenuRow.separator())
             rows.append(MenuRow.disabled("Rate Windows"))
-            for key in normalize_display_windows(self.settings.get("display_windows")):
+            for key in available_rate_window_keys(self.snapshot):
                 rate_window = self.get_window(key)
                 if rate_window:
                     value = (
@@ -2545,6 +2709,12 @@ class OverlayApp:
                 f"output {format_token_count(estimate.output_tokens)}"
             )
         )
+        rows.append(
+            MenuRow.disabled(
+                f"Long-context requests (>{format_token_count(LONG_CONTEXT_INPUT_THRESHOLD_TOKENS)} input): "
+                f"{estimate.long_context_request_count}"
+            )
+        )
 
         if estimate.pricing is None:
             rows.append(MenuRow.disabled(f"No pricing row configured for {model_name}"))
@@ -2552,11 +2722,22 @@ class OverlayApp:
             cached_rate = estimate.pricing.cached_input_per_million
             rows.append(
                 MenuRow.disabled(
-                    f"Rates /1M: input {format_api_rate(estimate.pricing.input_per_million)}, "
+                    f"Rates /1M (short): input {format_api_rate(estimate.pricing.input_per_million)}, "
                     f"cached {format_api_rate(cached_rate)}, "
+                    f"write {format_published_api_rate(estimate.pricing.cache_write_per_million)}, "
                     f"output {format_api_rate(estimate.pricing.output_per_million)}"
                 )
             )
+            if estimate.pricing.long_context_input_per_million is not None:
+                rows.append(
+                    MenuRow.disabled(
+                        f"Rates /1M (>{format_token_count(estimate.pricing.long_context_threshold_tokens or LONG_CONTEXT_INPUT_THRESHOLD_TOKENS)} input): "
+                        f"input {format_api_rate(estimate.pricing.long_context_input_per_million)}, "
+                        f"cached {format_api_rate(estimate.pricing.long_context_cached_input_per_million)}, "
+                        f"write {format_published_api_rate(estimate.pricing.long_context_cache_write_per_million)}, "
+                        f"output {format_api_rate(estimate.pricing.long_context_output_per_million)}"
+                    )
+                )
             rows.append(
                 MenuRow.disabled(
                     f"Costs: input {format_api_cost(estimate.input_cost)}, "
@@ -2567,6 +2748,7 @@ class OverlayApp:
 
         if estimate.warning:
             rows.append(MenuRow.disabled(estimate.warning))
+        rows.append(MenuRow.disabled(CACHE_WRITE_TELEMETRY_NOTE))
         rows.append(MenuRow.disabled("API-equivalent estimate only; not actual Codex billing"))
 
     def status_text(self) -> str:
@@ -2591,20 +2773,23 @@ class OverlayApp:
 
     def set_display_window(self, key: str, enabled: bool) -> None:
         current = set(normalize_display_windows(self.settings.get("display_windows")))
+        effective = set(effective_display_windows(self.settings, self.snapshot))
         if enabled:
             current.add(key)
-        elif key in current:
-            if len(current) == 1:
-                return
-            current.remove(key)
+        elif key in effective and len(effective) == 1:
+            return
+        else:
+            current.discard(key)
 
         ordered = [item for item in VALID_DISPLAY_WINDOWS if item in current]
+        if not ordered:
+            return
         self.settings["display_windows"] = ordered
         self.save_settings()
         self.request_render()
 
     def toggle_display_window(self, key: str) -> None:
-        current = set(normalize_display_windows(self.settings.get("display_windows")))
+        current = set(effective_display_windows(self.settings, self.snapshot))
         self.set_display_window(key, key not in current)
 
     def set_show_resets(self, enabled: bool) -> None:
