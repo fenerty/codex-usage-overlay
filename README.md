@@ -104,6 +104,25 @@ Supported settings include:
 - `show_token_counter`: show manual token counter
 - `show_api_cost_estimate`: show API-equivalent cost estimate
 
+## Performance And Polling
+
+Version `0.1.9` keeps the existing 500 ms refresh cadence while the overlay is
+shown. When a visibility mode withdraws it, the app checks whether it should
+wake every 1 second and ingests new log data every 5 seconds. It performs an
+immediate log catch-up before showing the overlay again.
+
+SQLite reading and session-file discovery are incremental during steady-state
+polling, and the runtime-state heartbeat is written every 2 seconds. These
+changes add no dependencies and do not change the UI, settings, data sources,
+or displayed calculations.
+
+Database, WAL, and shared-memory signatures wake the SQLite reader, with a
+5-second maximum-ID probe as a race-safe fallback. The newest ten session files
+and their active date directories are checked incrementally, with a full
+recursive discovery every 30 seconds. Unchanged labels and visibility state are
+reused, and monitor topology is normally enumerated only after native display
+notifications or during a 5-second fallback check.
+
 ## Privacy And Data
 
 The overlay reads local files only:
@@ -136,8 +155,20 @@ normal quit.
 ### I launched it but do not see it
 
 The overlay saves its last screen position in `codex_usage_overlay.settings.json`.
-If your monitor layout changed, delete the `position` value or set it to `null`.
-The app also clamps saved positions to the visible screen area on launch.
+On Windows, version `0.1.9` and newer re-enumerate active monitor work areas
+while running and move the overlay back on-screen after docking, undocking,
+display rearrangement, resolution changes, taskbar work-area changes, and
+sleep/resume. Native Windows notifications accelerate recovery, while
+lightweight polling provides a fallback. Stable automatic corrections are
+saved so the next launch uses the recovered coordinates.
+
+The `visible_window` mode withdraws the overlay when no non-minimized Codex
+window is visible; the overlay process intentionally remains running and keeps
+checking display topology before it is shown again. Version `0.1.9` does not
+change the Python/Tk process DPI-awareness mode.
+
+If the overlay still cannot be found, set `position` to `null` and restart the
+existing process.
 
 For the unified Windows desktop app, use version `0.1.8` or newer so the
 `foreground` and `visible_window` modes recognize the packaged `ChatGPT.exe`

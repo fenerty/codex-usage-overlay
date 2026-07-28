@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.9 - 2026-07-17
+
+- Recover the overlay into an active monitor work area after live
+  display-topology, resolution, taskbar work-area, and sleep/resume changes.
+- Combine lightweight topology polling with debounced native Windows
+  notifications, and persist stable automatically corrected coordinates.
+- Keep display recovery active while visibility modes withdraw the overlay,
+  without changing the existing Python/Tk DPI-awareness mode.
+- Keep the existing 500 ms refresh while shown, use a 1-second hidden
+  visibility wake and 5-second hidden log ingestion, and catch up immediately
+  before showing.
+- Make SQLite reads and session-file discovery incremental during steady-state
+  polling, and write the runtime heartbeat every 2 seconds.
+- Use database/WAL/SHM signatures plus a 5-second maximum-ID safety probe, and
+  retain a 30-second recursive session-discovery fallback.
+- Reuse unchanged labels, visibility state, and monitor snapshots; enumerate
+  displays after native notifications or on a 5-second fallback instead of on
+  every refresh or drag event.
+- Reduce background work without adding dependencies or changing the UI,
+  settings, data sources, or displayed calculations.
+
 ## 0.1.8 - 2026-07-13
 
 - Replace GPT-5.6 proxy estimates with published Sol, Terra, and Luna Standard

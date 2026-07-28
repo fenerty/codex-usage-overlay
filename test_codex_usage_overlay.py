@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 APP_PATH = Path(__file__).with_name("codex_usage_overlay.pyw")
@@ -84,6 +85,19 @@ def create_logs_db(path, rows):
             )
             """
         )
+        for row in rows:
+            connection.execute(
+                "INSERT INTO logs (ts, target, feedback_log_body) VALUES (?, ?, ?)",
+                row,
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def append_logs_db(path, rows):
+    connection = sqlite3.connect(path)
+    try:
         for row in rows:
             connection.execute(
                 "INSERT INTO logs (ts, target, feedback_log_body) VALUES (?, ?, ?)",
@@ -440,6 +454,76 @@ class RateParserTests(unittest.TestCase):
             self.assertEqual(snapshot.primary.remaining_percent, 79)
             self.assertEqual(snapshot.secondary.remaining_percent, 80)
 
+    def test_newer_jsonl_snapshot_wins_over_stale_sqlite(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            sessions = home / "sessions" / "2026" / "06" / "02"
+            sessions.mkdir(parents=True)
+            (sessions / "rollout.jsonl").write_text(
+                token_count_line(
+                    "2026-06-02T17:20:43Z",
+                    primary={"used_percent": 15, "window_minutes": 300},
+                    secondary={"used_percent": 19, "window_minutes": 10080},
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            create_logs_db(
+                home / "logs_2.sqlite",
+                [
+                    (
+                        1780420000,
+                        "codex_api::endpoint::responses_websocket",
+                        websocket_rate_log(
+                            primary={"used_percent": 21, "window_minutes": 300},
+                            secondary={"used_percent": 20, "window_minutes": 10080},
+                        ),
+                    )
+                ],
+            )
+
+            snapshot = overlay.RateLogReader(home).latest_snapshot(force_rescan=True)
+
+            self.assertIsNotNone(snapshot)
+            self.assertEqual(snapshot.source_kind, "session_jsonl")
+            self.assertEqual(snapshot.primary.remaining_percent, 85)
+            self.assertEqual(snapshot.secondary.remaining_percent, 81)
+
+    def test_sqlite_wins_equal_timestamp_tie(self):
+        observed_at = 1780420843
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            sessions = home / "sessions" / "2026" / "06" / "02"
+            sessions.mkdir(parents=True)
+            (sessions / "rollout.jsonl").write_text(
+                token_count_line(
+                    overlay.timestamp_from_epoch(observed_at),
+                    primary={"used_percent": 15, "window_minutes": 300},
+                    secondary={"used_percent": 19, "window_minutes": 10080},
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            create_logs_db(
+                home / "logs_2.sqlite",
+                [
+                    (
+                        observed_at,
+                        "codex_api::endpoint::responses_websocket",
+                        websocket_rate_log(
+                            primary={"used_percent": 21, "window_minutes": 300},
+                            secondary={"used_percent": 20, "window_minutes": 10080},
+                        ),
+                    )
+                ],
+            )
+
+            snapshot = overlay.RateLogReader(home).latest_snapshot(force_rescan=True)
+
+            self.assertIsNotNone(snapshot)
+            self.assertEqual(snapshot.source_kind, "logs_2.sqlite")
+            self.assertEqual(snapshot.primary.remaining_percent, 79)
+
     def test_jsonl_snapshot_wins_without_usable_sqlite_data(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             home = Path(temp_dir)
@@ -507,6 +591,454 @@ class RateParserTests(unittest.TestCase):
             self.assertIsNotNone(snapshot)
             self.assertEqual(snapshot.source_kind, "session_jsonl")
             self.assertEqual(snapshot.primary.remaining_percent, 85)
+
+
+class IncrementalSqliteReaderTests(unittest.TestCase):
+    TARGET = "codex_api::endpoint::responses_websocket"
+
+    def row(self, timestamp, used_percent, target=None, body=None):
+        return (
+            timestamp,
+            target or self.TARGET,
+            body
+            or websocket_rate_log(
+                primary={"used_percent": used_percent, "window_minutes": 300},
+                secondary=None,
+            ),
+        )
+
+    def test_unchanged_poll_does_not_reparse_historical_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "logs_2.sqlite"
+            create_logs_db(path, [self.row(1_000, 20)])
+            reader = overlay.SqliteRateLimitReader(path)
+            first = reader.latest_snapshot(force_rescan=True, now=0)
+
+            with mock.patch.object(
+                overlay,
+                "parse_sqlite_rate_limit_log_body",
+                wraps=overlay.parse_sqlite_rate_limit_log_body,
+            ) as parse_body:
+                second = reader.latest_snapshot(now=0.5)
+
+            self.assertEqual(first, second)
+            self.assertEqual(parse_body.call_count, 0)
+            self.assertEqual(reader._last_row_id, 1)
+
+    def test_appended_rows_are_consumed_once(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "logs_2.sqlite"
+            create_logs_db(path, [self.row(1_000, 20)])
+            reader = overlay.SqliteRateLimitReader(path)
+            reader.latest_snapshot(force_rescan=True, now=0)
+            append_logs_db(path, [self.row(1_001, 30)])
+
+            with mock.patch.object(
+                overlay,
+                "parse_sqlite_rate_limit_log_body",
+                wraps=overlay.parse_sqlite_rate_limit_log_body,
+            ) as parse_body:
+                updated = reader.latest_snapshot(now=0.5)
+                unchanged = reader.latest_snapshot(now=1.0)
+
+            self.assertEqual(updated.primary.remaining_percent, 70)
+            self.assertEqual(unchanged, updated)
+            self.assertEqual(parse_body.call_count, 1)
+            self.assertEqual(reader._last_row_id, 2)
+
+    def test_malformed_row_advances_checkpoint_and_later_valid_row_wins(self):
+        malformed = (
+            'stream_request: websocket event: '
+            '{"type":"codex.rate_limits","rate_limits"'
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "logs_2.sqlite"
+            create_logs_db(path, [self.row(1_000, 20)])
+            reader = overlay.SqliteRateLimitReader(path)
+            original = reader.latest_snapshot(force_rescan=True, now=0)
+            append_logs_db(path, [self.row(1_001, 0, body=malformed)])
+
+            rejected = reader.latest_snapshot(now=0.5)
+            checkpoint = reader._last_row_id
+            append_logs_db(path, [self.row(1_002, 45)])
+            updated = reader.latest_snapshot(now=1.0)
+
+            self.assertEqual(rejected, original)
+            self.assertEqual(checkpoint, 2)
+            self.assertEqual(updated.primary.remaining_percent, 55)
+            self.assertEqual(reader._last_row_id, 3)
+
+    def test_irrelevant_target_advances_checkpoint_without_reprocessing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "logs_2.sqlite"
+            create_logs_db(path, [self.row(1_000, 20)])
+            reader = overlay.SqliteRateLimitReader(path)
+            original = reader.latest_snapshot(force_rescan=True, now=0)
+            append_logs_db(
+                path,
+                [self.row(1_001, 90, target="codex_otel.log_only")],
+            )
+
+            with mock.patch.object(
+                overlay,
+                "parse_sqlite_rate_limit_log_body",
+                wraps=overlay.parse_sqlite_rate_limit_log_body,
+            ) as parse_body:
+                rejected = reader.latest_snapshot(now=0.5)
+                unchanged = reader.latest_snapshot(now=1.0)
+
+            self.assertEqual(rejected, original)
+            self.assertEqual(unchanged, original)
+            self.assertEqual(reader._last_row_id, 2)
+            self.assertEqual(parse_body.call_count, 0)
+
+    def test_database_replacement_resets_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            path = directory / "logs_2.sqlite"
+            replacement = directory / "replacement.sqlite"
+            create_logs_db(path, [self.row(1_000, 20), self.row(1_001, 30)])
+            reader = overlay.SqliteRateLimitReader(path)
+            reader.latest_snapshot(force_rescan=True, now=0)
+            create_logs_db(replacement, [self.row(1_002, 40)])
+            os.replace(replacement, path)
+
+            updated = reader.latest_snapshot(now=0.5)
+
+            self.assertEqual(updated.primary.remaining_percent, 60)
+            self.assertEqual(reader._last_row_id, 1)
+
+    def test_row_id_rollback_triggers_full_recovery_scan(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "logs_2.sqlite"
+            create_logs_db(
+                path,
+                [
+                    self.row(1_000, 20),
+                    self.row(1_001, 30),
+                    self.row(1_002, 40),
+                ],
+            )
+            reader = overlay.SqliteRateLimitReader(path)
+            reader.latest_snapshot(force_rescan=True, now=0)
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute("DELETE FROM logs")
+                connection.execute("DELETE FROM sqlite_sequence WHERE name = 'logs'")
+                connection.execute(
+                    "INSERT INTO logs (ts, target, feedback_log_body) VALUES (?, ?, ?)",
+                    self.row(1_003, 55),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            recovered = reader.latest_snapshot(now=0.5)
+
+            self.assertEqual(recovered.primary.remaining_percent, 45)
+            self.assertEqual(reader._last_row_id, 1)
+
+    def test_sqlite_error_preserves_checkpoint_and_retries(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "logs_2.sqlite"
+            create_logs_db(path, [self.row(1_000, 20)])
+            reader = overlay.SqliteRateLimitReader(path)
+            original = reader.latest_snapshot(force_rescan=True, now=0)
+            append_logs_db(path, [self.row(1_001, 35)])
+            checkpoint = reader._last_row_id
+
+            with mock.patch.object(
+                overlay.sqlite3,
+                "connect",
+                side_effect=sqlite3.OperationalError("busy"),
+            ):
+                failed = reader.latest_snapshot(now=0.5)
+
+            recovered = reader.latest_snapshot(now=1.0)
+
+            self.assertEqual(failed, original)
+            self.assertEqual(checkpoint, 1)
+            self.assertEqual(recovered.primary.remaining_percent, 65)
+            self.assertEqual(reader._last_row_id, 2)
+
+    def test_fallback_probe_detects_update_when_file_signature_is_stale(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "logs_2.sqlite"
+            create_logs_db(path, [self.row(1_000, 20)])
+            reader = overlay.SqliteRateLimitReader(path)
+            original = reader.latest_snapshot(force_rescan=True, now=0)
+            stale_signature = reader._database_signature
+            append_logs_db(path, [self.row(1_001, 50)])
+
+            with mock.patch.object(
+                reader,
+                "_current_database_signature",
+                return_value=stale_signature,
+            ):
+                before_fallback = reader.latest_snapshot(now=1)
+                after_fallback = reader.latest_snapshot(
+                    now=overlay.SQLITE_FALLBACK_PROBE_INTERVAL_SECONDS,
+                )
+
+            self.assertEqual(before_fallback, original)
+            self.assertEqual(after_fallback.primary.remaining_percent, 50)
+            self.assertEqual(reader._last_row_id, 2)
+
+
+class CountingRateLogReader(overlay.RateLogReader):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.discovery_calls = 0
+
+    def _find_session_files(self):
+        self.discovery_calls += 1
+        return super()._find_session_files()
+
+
+class SessionDiscoveryCacheTests(unittest.TestCase):
+    def write_snapshot(self, path, timestamp, used_percent):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            token_count_line(
+                timestamp,
+                primary={"used_percent": used_percent, "window_minutes": 300},
+                secondary=None,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def test_known_file_append_does_not_repeat_recursive_discovery(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            path = home / "sessions" / "2026" / "06" / "01" / "rollout.jsonl"
+            self.write_snapshot(path, "2026-06-01T12:00:00Z", 50)
+            reader = CountingRateLogReader(home)
+            first = reader.latest_snapshot(force_rescan=True, now=0)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    token_count_line(
+                        "2026-06-01T12:00:01Z",
+                        primary={"used_percent": 40, "window_minutes": 300},
+                        secondary=None,
+                    )
+                    + "\n"
+                )
+
+            second = reader.latest_snapshot(now=1)
+
+            self.assertEqual(first.primary.remaining_percent, 50)
+            self.assertEqual(second.primary.remaining_percent, 60)
+            self.assertEqual(reader.discovery_calls, 1)
+
+    def test_hot_directory_finds_new_file_without_recursive_discovery(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            directory = home / "sessions" / "2026" / "06" / "01"
+            self.write_snapshot(
+                directory / "old.jsonl",
+                "2026-06-01T12:00:00Z",
+                50,
+            )
+            reader = CountingRateLogReader(home)
+            reader.latest_snapshot(force_rescan=True, now=0)
+            self.write_snapshot(
+                directory / "new.jsonl",
+                "2026-06-01T12:00:02Z",
+                30,
+            )
+
+            updated = reader.latest_snapshot(now=1)
+
+            self.assertEqual(updated.primary.remaining_percent, 70)
+            self.assertEqual(reader.discovery_calls, 1)
+
+    def test_recursive_discovery_runs_at_fallback_boundary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            self.write_snapshot(
+                home / "sessions" / "2026" / "06" / "01" / "old.jsonl",
+                "2026-06-01T12:00:00Z",
+                50,
+            )
+            reader = CountingRateLogReader(home)
+            original = reader.latest_snapshot(force_rescan=True, now=0)
+            self.write_snapshot(
+                home / "sessions" / "2025" / "01" / "01" / "new.jsonl",
+                "2026-06-01T12:00:03Z",
+                25,
+            )
+
+            before_boundary = reader.latest_snapshot(
+                now=overlay.SESSION_FULL_RESCAN_INTERVAL_SECONDS - 1,
+            )
+            after_boundary = reader.latest_snapshot(
+                now=overlay.SESSION_FULL_RESCAN_INTERVAL_SECONDS,
+            )
+
+            self.assertEqual(original, before_boundary)
+            self.assertEqual(after_boundary.primary.remaining_percent, 75)
+            self.assertEqual(reader.discovery_calls, 2)
+
+
+class HistoricalSqliteRateLimitReader(overlay.SqliteRateLimitReader):
+    def latest_snapshot(self, row_limit=overlay.SQLITE_RATE_ROWS_TO_SCAN, force_rescan=False, now=None):
+        return super().latest_snapshot(
+            row_limit=row_limit,
+            force_rescan=True,
+            now=now,
+        )
+
+
+class HistoricalRateLogReader(overlay.RateLogReader):
+    def __init__(self, codex_home):
+        super().__init__(codex_home)
+        self.sqlite_reader = HistoricalSqliteRateLimitReader(
+            self.codex_home / "logs_2.sqlite",
+        )
+
+    def _refresh_session_files(self, force_rescan, now):
+        self._last_full_session_scan_at = now
+        return self._find_session_files()[:overlay.MAX_SESSION_FILES_TO_SCAN]
+
+
+class TelemetryReplayEquivalenceTests(unittest.TestCase):
+    @staticmethod
+    def usage(total_tokens):
+        return {
+            "input_tokens": total_tokens - 20,
+            "cached_input_tokens": 10,
+            "output_tokens": 20,
+            "reasoning_output_tokens": 5,
+            "total_tokens": total_tokens,
+        }
+
+    @staticmethod
+    def estimate(counter):
+        detected_model = overlay.DetectedModel("gpt-5.5", "test")
+        return overlay.estimate_api_cost(
+            counter.totals,
+            detected_model,
+            detected_model.model,
+            short_context_usage=counter.short_context_totals,
+            long_context_usage=counter.long_context_totals,
+            long_context_request_count=counter.long_context_request_count,
+        )
+
+    def test_historical_and_adaptive_readers_replay_identically(self):
+        target = "codex_api::endpoint::responses_websocket"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            session_path = home / "sessions" / "2026" / "06" / "02" / "rollout.jsonl"
+            session_path.parent.mkdir(parents=True)
+            session_path.write_text(
+                token_count_line(
+                    "2026-06-02T17:20:40Z",
+                    primary={"used_percent": 10, "window_minutes": 300},
+                    secondary={"used_percent": 5, "window_minutes": 10080},
+                    last_usage=self.usage(100),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            create_logs_db(
+                home / "logs_2.sqlite",
+                [
+                    (
+                        int(overlay.timestamp_to_epoch("2026-06-02T17:20:41Z")),
+                        target,
+                        websocket_rate_log(
+                            primary={"used_percent": 20, "window_minutes": 300},
+                            secondary={"used_percent": 6, "window_minutes": 10080},
+                        ),
+                    )
+                ],
+            )
+
+            historical = HistoricalRateLogReader(home)
+            adaptive = overlay.RateLogReader(home)
+            historical_counter = overlay.TokenCounter(reset_at=0)
+            adaptive_counter = overlay.TokenCounter(reset_at=0)
+
+            def compare_poll(now, force=False):
+                historical_batch = historical.read_updates(force_rescan=force, now=now)
+                adaptive_batch = adaptive.read_updates(force_rescan=force, now=now)
+                historical_counter.add_events(historical_batch.token_events, now=now)
+                adaptive_counter.add_events(adaptive_batch.token_events, now=now)
+                self.assertEqual(adaptive_batch.snapshot, historical_batch.snapshot)
+                self.assertEqual(adaptive_counter.state_dict(), historical_counter.state_dict())
+                self.assertEqual(
+                    self.estimate(adaptive_counter),
+                    self.estimate(historical_counter),
+                )
+
+            compare_poll(0, force=True)
+
+            partial_line = token_count_line(
+                "2026-06-02T17:20:42Z",
+                primary={"used_percent": 30, "window_minutes": 300},
+                secondary={"used_percent": 7, "window_minutes": 10080},
+                last_usage=self.usage(200),
+            )
+            split_at = len(partial_line) // 2
+            with session_path.open("a", encoding="utf-8") as handle:
+                handle.write("{bad json}\n")
+                handle.write(partial_line[:split_at])
+            append_logs_db(
+                home / "logs_2.sqlite",
+                [
+                    (
+                        int(overlay.timestamp_to_epoch("2026-06-02T17:20:42Z")),
+                        "codex_otel.log_only",
+                        websocket_rate_log(
+                            primary={"used_percent": 99, "window_minutes": 300},
+                            secondary=None,
+                        ),
+                    ),
+                    (
+                        int(overlay.timestamp_to_epoch("2026-06-02T17:20:42Z")),
+                        target,
+                        'stream_request: websocket event: '
+                        '{"type":"codex.rate_limits","rate_limits"',
+                    ),
+                ],
+            )
+            compare_poll(1)
+
+            with session_path.open("a", encoding="utf-8") as handle:
+                handle.write(partial_line[split_at:] + "\n")
+            append_logs_db(
+                home / "logs_2.sqlite",
+                [
+                    (
+                        int(overlay.timestamp_to_epoch("2026-06-02T17:20:43Z")),
+                        target,
+                        websocket_rate_log(
+                            primary={"used_percent": 40, "window_minutes": 300},
+                            secondary={"used_percent": 8, "window_minutes": 10080},
+                        ),
+                    )
+                ],
+            )
+            compare_poll(2)
+
+            with session_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    token_count_line(
+                        "2026-06-02T17:20:44Z",
+                        primary={"used_percent": 50, "window_minutes": 300},
+                        secondary={"used_percent": 9, "window_minutes": 10080},
+                        last_usage=self.usage(300),
+                    )
+                    + "\n"
+                )
+            compare_poll(3)
+
+            self.assertEqual(adaptive_counter.totals.total_tokens, 600)
+            adaptive_snapshot = adaptive.latest_snapshot(now=4)
+            historical_snapshot = historical.latest_snapshot(now=4)
+            self.assertEqual(adaptive_snapshot, historical_snapshot)
+            self.assertEqual(adaptive_snapshot.source_kind, "session_jsonl")
 
 
 class TokenParserTests(unittest.TestCase):
@@ -926,7 +1458,7 @@ class RuntimeStateTests(unittest.TestCase):
                 source_observed_at=1780420843,
             )
 
-            store.write(snapshot, counter, estimate)
+            self.assertTrue(store.write(snapshot, counter, estimate))
             state = json.loads(path.read_text(encoding="utf-8"))
 
             self.assertEqual(state["app"], overlay.APP_NAME)
@@ -980,6 +1512,19 @@ class RuntimeStateTests(unittest.TestCase):
             store.delete()
 
             self.assertFalse(path.exists())
+
+    def test_write_failure_is_reported_for_scheduler_retry(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            blocked_parent = Path(temp_dir) / "not-a-directory"
+            blocked_parent.write_text("blocked", encoding="utf-8")
+            store = overlay.RuntimeStateStore(
+                path=blocked_parent / "state.json",
+                pid=123,
+            )
+
+            self.assertFalse(
+                store.write(None, overlay.TokenCounter(reset_at=1_000))
+            )
 
 
 class ProcessIdentityTests(unittest.TestCase):
@@ -1095,6 +1640,693 @@ class PositionTests(unittest.TestCase):
         self.assertEqual(overlay.popup_max_size((0, 0, 300, 200)), (284, 184))
 
 
+class MonitorAwarePositionTests(unittest.TestCase):
+    def monitor(
+        self,
+        device_name,
+        monitor_bounds,
+        work_area=None,
+        is_primary=False,
+    ):
+        return overlay.MonitorWorkArea(
+            device_name=device_name,
+            monitor_bounds=monitor_bounds,
+            work_area=work_area or monitor_bounds,
+            is_primary=is_primary,
+        )
+
+    def laptop_monitor(self):
+        return self.monitor(
+            r"\\.\DISPLAY1",
+            (0, 0, 1920, 1200),
+            (0, 0, 1920, 1152),
+            is_primary=True,
+        )
+
+    def external_monitor(self):
+        return self.monitor(
+            r"\\.\DISPLAY2",
+            (1920, 0, 2560, 1440),
+            (1920, 0, 2560, 1400),
+        )
+
+    def test_stale_external_position_moves_into_laptop_work_area(self):
+        position = overlay.normalize_overlay_position_for_monitors(
+            [3895, 940],
+            [self.laptop_monitor()],
+            (190, 40),
+        )
+
+        self.assertEqual(position, [1730, 940])
+
+    def test_valid_secondary_monitor_position_is_unchanged(self):
+        monitors = [self.laptop_monitor(), self.external_monitor()]
+
+        position = overlay.normalize_overlay_position_for_monitors(
+            [3895, 940],
+            monitors,
+            (190, 40),
+        )
+        selected = overlay.choose_monitor_for_overlay([3895, 940], (190, 40), monitors)
+
+        self.assertEqual(position, [3895, 940])
+        self.assertEqual(selected.device_name, r"\\.\DISPLAY2")
+
+    def test_position_in_virtual_screen_hole_moves_to_nearest_work_area(self):
+        monitors = [
+            self.laptop_monitor(),
+            self.monitor(
+                r"\\.\DISPLAY2",
+                (1920, -1440, 2560, 1440),
+                (1920, -1440, 2560, 1400),
+            ),
+        ]
+
+        selected = overlay.choose_monitor_for_overlay([100, -500], (190, 40), monitors)
+        position = overlay.normalize_overlay_position_for_monitors(
+            [100, -500],
+            monitors,
+            (190, 40),
+        )
+
+        self.assertEqual(selected.device_name, r"\\.\DISPLAY1")
+        self.assertEqual(position, [100, 0])
+
+    def test_negative_secondary_monitor_coordinates_remain_valid(self):
+        monitors = [
+            self.laptop_monitor(),
+            self.monitor(
+                r"\\.\DISPLAY2",
+                (-1920, 0, 1920, 1080),
+                (-1920, 0, 1920, 1040),
+            ),
+        ]
+
+        position = overlay.normalize_overlay_position_for_monitors(
+            [-1800, 100],
+            monitors,
+            (190, 40),
+        )
+
+        self.assertEqual(position, [-1800, 100])
+
+    def test_position_in_taskbar_strip_is_clamped_to_work_area(self):
+        position = overlay.normalize_overlay_position_for_monitors(
+            [1730, 1160],
+            [self.laptop_monitor()],
+            (190, 40),
+        )
+
+        self.assertEqual(position, [1730, 1112])
+
+    def test_monitor_selection_uses_nearest_then_primary_for_ties(self):
+        primary = self.monitor(r"\\.\DISPLAY1", (0, 0, 1000, 1000), is_primary=True)
+        secondary = self.monitor(r"\\.\DISPLAY2", (2000, 0, 1000, 1000))
+        monitors = [secondary, primary]
+
+        nearest = overlay.choose_monitor_for_overlay([1750, 100], (100, 100), monitors)
+        tied = overlay.choose_monitor_for_overlay([1450, 100], (100, 100), monitors)
+
+        self.assertEqual(nearest.device_name, r"\\.\DISPLAY2")
+        self.assertEqual(tied.device_name, r"\\.\DISPLAY1")
+
+    def test_oversized_overlay_keeps_a_recoverable_region_visible(self):
+        monitor = self.monitor(r"\\.\DISPLAY1", (0, 0, 300, 200), is_primary=True)
+
+        position = overlay.normalize_overlay_position_for_monitors(
+            [5000, 5000],
+            [monitor],
+            (500, 300),
+        )
+
+        visible_width = max(0, min(position[0] + 500, 300) - max(position[0], 0))
+        visible_height = max(0, min(position[1] + 300, 200) - max(position[1], 0))
+        self.assertGreaterEqual(visible_width, overlay.MIN_VISIBLE_PIXELS)
+        self.assertGreaterEqual(visible_height, overlay.MIN_VISIBLE_PIXELS)
+
+    def test_topology_fingerprint_is_order_independent_and_includes_work_area(self):
+        primary = self.laptop_monitor()
+        secondary = self.external_monitor()
+        changed_work_area = self.monitor(
+            secondary.device_name,
+            secondary.monitor_bounds,
+            (1920, 0, 2560, 1360),
+        )
+
+        original = overlay.monitor_topology_fingerprint([primary, secondary])
+        reordered = overlay.monitor_topology_fingerprint([secondary, primary])
+        changed = overlay.monitor_topology_fingerprint([primary, changed_work_area])
+
+        self.assertEqual(original, reordered)
+        self.assertNotEqual(original, changed)
+
+    def test_native_message_classifier_covers_display_work_area_dpi_and_resume(self):
+        self.assertTrue(overlay.is_display_reconcile_message(0x007E))
+        self.assertTrue(overlay.is_display_reconcile_message(0x001A, 0x002F))
+        self.assertTrue(overlay.is_display_reconcile_message(0x02E0))
+        self.assertTrue(overlay.is_display_reconcile_message(0x0218, 0x0012))
+        self.assertTrue(overlay.is_display_reconcile_message(0x0218, 0x0007))
+        self.assertTrue(overlay.is_display_reconcile_message(0x0218, 0x0006))
+        self.assertTrue(overlay.is_display_reconcile_message(0x0219, 0x0007))
+        self.assertTrue(overlay.is_display_reconcile_message(0x0219, 0x0018))
+
+        self.assertTrue(overlay.is_display_reconcile_message(0x001A, 0))
+        self.assertTrue(overlay.is_display_reconcile_message(0x0219, 0x8000))
+        self.assertFalse(overlay.is_display_reconcile_message(0x0218, 0x0004))
+        self.assertFalse(overlay.is_display_reconcile_message(0x000F))
+
+
+class NativeDisplayObserverTests(unittest.TestCase):
+    class FakeCommonControls:
+        def __init__(self):
+            self.forwarded = []
+            self.removed = []
+
+        def DefSubclassProc(self, hwnd, message, wparam, lparam):
+            self.forwarded.append((hwnd, message, wparam, lparam))
+            return 73
+
+        def RemoveWindowSubclass(self, hwnd, proc, subclass_id):
+            self.removed.append((hwnd, proc, int(subclass_id.value)))
+            return True
+
+    def make_observer(self):
+        observer = object.__new__(overlay.WindowsDisplayChangeObserver)
+        observer._hwnd = 123
+        observer._pending = set()
+        observer._callback_error = None
+        observer._proc = object()
+        observer._comctl32 = self.FakeCommonControls()
+        return observer
+
+    def test_callback_records_only_relevant_messages_and_always_forwards(self):
+        observer = self.make_observer()
+
+        relevant_result = observer._subclass_proc(
+            123,
+            overlay.WM_DISPLAYCHANGE,
+            0,
+            0,
+            overlay.WindowsDisplayChangeObserver.SUBCLASS_ID,
+            0,
+        )
+        unrelated_result = observer._subclass_proc(
+            123,
+            0x000F,
+            0,
+            0,
+            overlay.WindowsDisplayChangeObserver.SUBCLASS_ID,
+            0,
+        )
+
+        self.assertEqual(relevant_result, 73)
+        self.assertEqual(unrelated_result, 73)
+        self.assertEqual(observer.take_pending(), {(overlay.WM_DISPLAYCHANGE, 0)})
+        self.assertEqual(len(observer._comctl32.forwarded), 2)
+        self.assertIsNone(observer._callback_error)
+
+    def test_nc_destroy_removes_subclass_and_clears_wrapper_handle(self):
+        observer = self.make_observer()
+
+        result = observer._subclass_proc(
+            123,
+            overlay.WM_NCDESTROY,
+            0,
+            0,
+            overlay.WindowsDisplayChangeObserver.SUBCLASS_ID,
+            0,
+        )
+
+        self.assertEqual(result, 73)
+        self.assertEqual(observer._hwnd, 0)
+        self.assertEqual(len(observer._comctl32.removed), 1)
+        self.assertEqual(len(observer._comctl32.forwarded), 1)
+
+
+class FakeDisplayRoot:
+    def __init__(self, position=(3895, 940), size=(190, 40), withdrawn=False):
+        self.position = [int(position[0]), int(position[1])]
+        self.size = size
+        self.withdrawn = withdrawn
+        self.geometry_calls = []
+        self.deiconify_calls = 0
+        self.withdraw_calls = 0
+        self.attribute_calls = []
+        self.events = []
+        self.after_callbacks = {}
+        self.after_cancel_calls = []
+        self._next_after_identifier = 1
+        self.idle_update_calls = 0
+        self.pointer_query_calls = 0
+
+    def update_idletasks(self):
+        self.idle_update_calls += 1
+
+    def winfo_x(self):
+        return self.position[0]
+
+    def winfo_y(self):
+        return self.position[1]
+
+    def winfo_width(self):
+        return self.size[0]
+
+    def winfo_reqwidth(self):
+        return self.size[0]
+
+    def winfo_height(self):
+        return self.size[1]
+
+    def winfo_reqheight(self):
+        return self.size[1]
+
+    def winfo_pointerx(self):
+        self.pointer_query_calls += 1
+        return self.position[0]
+
+    def winfo_pointery(self):
+        self.pointer_query_calls += 1
+        return self.position[1]
+
+    def geometry(self, value):
+        split_at = next(index for index in range(1, len(value)) if value[index] in "+-")
+        self.position = [int(value[:split_at]), int(value[split_at:])]
+        self.geometry_calls.append(value)
+        self.events.append(("geometry", tuple(self.position)))
+
+    def deiconify(self):
+        self.withdrawn = False
+        self.deiconify_calls += 1
+        self.events.append(("deiconify", None))
+
+    def withdraw(self):
+        self.withdrawn = True
+        self.withdraw_calls += 1
+        self.events.append(("withdraw", None))
+
+    def attributes(self, *args):
+        self.attribute_calls.append(args)
+
+    def after(self, _delay, callback):
+        identifier = f"after-{self._next_after_identifier}"
+        self._next_after_identifier += 1
+        self.after_callbacks[identifier] = callback
+        return identifier
+
+    def after_cancel(self, identifier):
+        self.after_cancel_calls.append(identifier)
+        self.after_callbacks.pop(identifier, None)
+
+
+class DisplayTopologyLifecycleTests(unittest.TestCase):
+    def monitor(
+        self,
+        device_name,
+        monitor_bounds,
+        work_area=None,
+        is_primary=False,
+    ):
+        return overlay.MonitorWorkArea(
+            device_name=device_name,
+            monitor_bounds=monitor_bounds,
+            work_area=work_area or monitor_bounds,
+            is_primary=is_primary,
+        )
+
+    def laptop_monitor(self):
+        return self.monitor(
+            r"\\.\DISPLAY1",
+            (0, 0, 1920, 1200),
+            (0, 0, 1920, 1152),
+            is_primary=True,
+        )
+
+    def external_monitor(self):
+        return self.monitor(
+            r"\\.\DISPLAY2",
+            (1920, 0, 2560, 1440),
+            (1920, 0, 2560, 1400),
+        )
+
+    def test_drag_motion_uses_cached_monitor_snapshot(self):
+        laptop = self.laptop_monitor()
+        app = self.make_app(position=(100, 100), stable_monitors=[laptop])
+        app._stable_monitors = (laptop,)
+        app._last_good_monitors = (laptop,)
+        event = type(
+            "DragEvent",
+            (),
+            {"x_root": 120, "y_root": 130},
+        )()
+
+        with mock.patch.object(overlay, "windows_monitor_work_areas") as enumerate_monitors:
+            overlay.OverlayApp.start_drag(app, event)
+            idle_updates_before_motion = app.root.idle_update_calls
+            event.x_root = 220
+            event.y_root = 230
+            overlay.OverlayApp.drag(app, event)
+
+        enumerate_monitors.assert_not_called()
+        self.assertEqual(app.root.position, [200, 200])
+        self.assertEqual(app.root.idle_update_calls, idle_updates_before_motion)
+        self.assertEqual(app.root.pointer_query_calls, 0)
+
+    def test_drag_start_refreshes_cache_when_topology_is_dirty(self):
+        laptop = self.laptop_monitor()
+        external = self.external_monitor()
+        app = self.make_app(position=(100, 100), stable_monitors=[laptop])
+        app._stable_monitors = (laptop,)
+        app._last_good_monitors = (laptop,)
+        app._native_display_dirty = True
+        app._native_display_dirty_at = 9.0
+        event = type(
+            "DragEvent",
+            (),
+            {"x_root": 120, "y_root": 130},
+        )()
+
+        with (
+            mock.patch.object(overlay.time, "monotonic", return_value=10.0),
+            mock.patch.object(
+                overlay,
+                "windows_monitor_work_areas",
+                return_value=(external,),
+            ) as enumerate_monitors,
+        ):
+            overlay.OverlayApp.start_drag(app, event)
+
+        enumerate_monitors.assert_called_once()
+        self.assertEqual(app._drag_monitors, (external,))
+        self.assertEqual(
+            app._next_display_poll_at,
+            10.0 + overlay.DISPLAY_TOPOLOGY_SAMPLE_SECONDS,
+        )
+
+    def test_clean_drag_release_returns_to_display_fallback_deadline(self):
+        laptop = self.laptop_monitor()
+        app = self.make_app(position=(100, 100), stable_monitors=[laptop])
+        app._stable_monitors = (laptop,)
+        app._last_good_monitors = (laptop,)
+        app.is_dragging = True
+        app.drag_offset = (20, 30)
+
+        with (
+            mock.patch.object(overlay.time, "monotonic", return_value=20.0),
+            mock.patch.object(
+                overlay,
+                "windows_monitor_work_areas",
+                return_value=(laptop,),
+            ) as enumerate_monitors,
+        ):
+            overlay.OverlayApp.end_drag(app, None)
+
+        enumerate_monitors.assert_called_once()
+        self.assertEqual(
+            app._next_display_poll_at,
+            20.0 + overlay.DISPLAY_TOPOLOGY_POLL_INTERVAL_SECONDS,
+        )
+
+    def make_app(
+        self,
+        position=(3895, 940),
+        stable_monitors=None,
+        should_show=True,
+        withdrawn=False,
+    ):
+        app = object.__new__(overlay.OverlayApp)
+        app.root = FakeDisplayRoot(position=position, withdrawn=withdrawn)
+        app.settings = {
+            "position": list(position),
+            "visibility_mode": "visible_window",
+        }
+        app.process_backend = type(
+            "DisplayBackend",
+            (),
+            {"should_show": lambda _self, _mode: should_show},
+        )()
+        app.is_dragging = False
+        app.drag_offset = None
+        app.menu_active = False
+        app.menu_window = None
+        app.menu_anchor = None
+        app.needs_render_after_drag = False
+        app.needs_render_after_menu = False
+        app.needs_visibility_after_menu = False
+        app._stable_monitor_fingerprint = (
+            overlay.monitor_topology_fingerprint(stable_monitors)
+            if stable_monitors is not None
+            else None
+        )
+        app._pending_monitor_fingerprint = None
+        app._pending_monitor_first_seen_at = 0.0
+        app._pending_monitor_last_seen_at = 0.0
+        app._pending_monitor_sample_count = 0
+        app._native_display_dirty = False
+        app._native_display_dirty_at = 0.0
+        app._display_reconcile_deferred = False
+        app._display_verification_after_id = None
+        app._pending_drag_position = None
+        app._display_observer = None
+        app._startup_complete = True
+        app._last_overlay_size = (190, 40)
+        app.save_calls = 0
+        app.save_settings = lambda: setattr(app, "save_calls", app.save_calls + 1)
+        app.request_render = lambda force=False: None
+        return app
+
+    def test_changed_topology_requires_two_samples_then_corrects_and_persists_once(self):
+        laptop = self.laptop_monitor()
+        app = self.make_app(stable_monitors=[laptop, self.external_monitor()])
+
+        with mock.patch.object(overlay, "windows_monitor_work_areas", return_value=(laptop,)):
+            self.assertFalse(overlay.OverlayApp._check_display_topology(app, now=1.0))
+            self.assertEqual(app.root.position, [3895, 940])
+            self.assertEqual(app.save_calls, 0)
+
+            self.assertTrue(overlay.OverlayApp._check_display_topology(app, now=1.25))
+            self.assertEqual(app.root.position, [1730, 940])
+            self.assertEqual(app.settings["position"], [1730, 940])
+            self.assertEqual(app.save_calls, 1)
+
+            self.assertFalse(overlay.OverlayApp._check_display_topology(app, now=1.5))
+
+        self.assertEqual(app.root.geometry_calls, ["+1730+940"])
+        self.assertEqual(app.save_calls, 1)
+
+    def test_native_event_burst_uses_trailing_debounce_and_one_write(self):
+        class PendingObserver:
+            def __init__(self):
+                self.pending = {
+                    (overlay.WM_DISPLAYCHANGE, 0),
+                    (overlay.WM_SETTINGCHANGE, overlay.SPI_SETWORKAREA),
+                    (overlay.WM_DPICHANGED, 0),
+                }
+
+            def take_pending(self):
+                pending = self.pending
+                self.pending = set()
+                return pending
+
+        laptop = self.laptop_monitor()
+        app = self.make_app(stable_monitors=[laptop, self.external_monitor()])
+        app._display_observer = PendingObserver()
+
+        with mock.patch.object(overlay, "windows_monitor_work_areas", return_value=(laptop,)):
+            self.assertFalse(overlay.OverlayApp._check_display_topology(app, now=10.0))
+            self.assertFalse(overlay.OverlayApp._check_display_topology(app, now=10.25))
+            self.assertTrue(overlay.OverlayApp._check_display_topology(app, now=10.5))
+            self.assertFalse(overlay.OverlayApp._check_display_topology(app, now=11.0))
+
+        self.assertEqual(app.root.geometry_calls, ["+1730+940"])
+        self.assertEqual(app.settings["position"], [1730, 940])
+        self.assertEqual(app.save_calls, 1)
+
+    def test_refresh_consumer_retries_hook_and_records_callback_failure(self):
+        class RecoveringObserver:
+            def __init__(self):
+                self._hwnd = 0
+                self.install_calls = 0
+
+            def install_if_mapped(self):
+                self.install_calls += 1
+                return False
+
+            def take_callback_error(self):
+                return RuntimeError("native callback test failure")
+
+            def take_pending(self):
+                return {(overlay.WM_DISPLAYCHANGE, 0)}
+
+        app = self.make_app(stable_monitors=[self.laptop_monitor()])
+        observer = RecoveringObserver()
+        app._display_observer = observer
+        app._native_display_observer_error = None
+
+        self.assertTrue(overlay.OverlayApp._consume_native_display_notifications(app, 12.0))
+
+        self.assertEqual(observer.install_calls, 1)
+        self.assertTrue(app._native_display_dirty)
+        self.assertEqual(app._native_display_dirty_at, 12.0)
+        self.assertIn("native callback test failure", app._native_display_observer_error)
+
+    def test_empty_topology_does_not_move_or_persist(self):
+        stable_monitors = [self.laptop_monitor(), self.external_monitor()]
+        app = self.make_app(stable_monitors=stable_monitors)
+        stable_fingerprint = app._stable_monitor_fingerprint
+
+        with mock.patch.object(overlay, "windows_monitor_work_areas", return_value=()):
+            self.assertFalse(overlay.OverlayApp._check_display_topology(app, now=2.0))
+
+        self.assertEqual(app.root.position, [3895, 940])
+        self.assertEqual(app.root.geometry_calls, [])
+        self.assertEqual(app.settings["position"], [3895, 940])
+        self.assertEqual(app.save_calls, 0)
+        self.assertEqual(app._stable_monitor_fingerprint, stable_fingerprint)
+
+    def test_first_valid_topology_after_empty_startup_also_requires_two_samples(self):
+        laptop = self.laptop_monitor()
+        app = self.make_app(stable_monitors=None)
+
+        with mock.patch.object(overlay, "windows_monitor_work_areas", return_value=(laptop,)):
+            self.assertFalse(overlay.OverlayApp._check_display_topology(app, now=2.0))
+            self.assertEqual(app.root.position, [3895, 940])
+            self.assertEqual(app.save_calls, 0)
+
+            self.assertTrue(overlay.OverlayApp._check_display_topology(app, now=2.25))
+
+        self.assertEqual(app.root.position, [1730, 940])
+        self.assertEqual(app.settings["position"], [1730, 940])
+        self.assertEqual(app.save_calls, 1)
+
+    def test_hidden_visible_window_is_corrected_without_deiconifying(self):
+        laptop = self.laptop_monitor()
+        app = self.make_app(
+            stable_monitors=[laptop, self.external_monitor()],
+            should_show=False,
+            withdrawn=True,
+        )
+
+        with mock.patch.object(overlay, "windows_monitor_work_areas", return_value=(laptop,)):
+            self.assertFalse(overlay.OverlayApp._check_display_topology(app, now=3.0))
+            self.assertTrue(overlay.OverlayApp._check_display_topology(app, now=3.25))
+
+        self.assertEqual(app.root.position, [1730, 940])
+        self.assertEqual(app.settings["position"], [1730, 940])
+        self.assertEqual(app.save_calls, 1)
+        self.assertTrue(app.root.withdrawn)
+        self.assertEqual(app.root.deiconify_calls, 0)
+
+    def test_update_visibility_corrects_position_before_deiconifying(self):
+        laptop = self.laptop_monitor()
+        app = self.make_app(stable_monitors=[laptop], should_show=True, withdrawn=True)
+
+        with mock.patch.object(overlay, "windows_monitor_work_areas", return_value=(laptop,)):
+            overlay.OverlayApp.update_visibility(app, force=True)
+
+        self.assertEqual(app.root.position, [1730, 940])
+        self.assertEqual(app.settings["position"], [1730, 940])
+        self.assertEqual(app.save_calls, 1)
+        self.assertEqual(app.root.events[:2], [("geometry", (1730, 940)), ("deiconify", None)])
+
+    def test_display_change_during_drag_waits_for_release_and_stable_sample(self):
+        laptop = self.laptop_monitor()
+        app = self.make_app(stable_monitors=[laptop, self.external_monitor()])
+        app.is_dragging = True
+        app.drag_offset = (5, 5)
+
+        with mock.patch.object(overlay, "windows_monitor_work_areas", return_value=(laptop,)):
+            self.assertFalse(overlay.OverlayApp._check_display_topology(app, now=4.0))
+            self.assertFalse(overlay.OverlayApp._check_display_topology(app, now=4.25))
+            self.assertTrue(app._display_reconcile_deferred)
+            self.assertEqual(app.root.position, [3895, 940])
+            self.assertEqual(app.save_calls, 0)
+
+            with mock.patch.object(overlay.time, "monotonic", return_value=4.5):
+                overlay.OverlayApp.end_drag(app, None)
+
+            self.assertEqual(app.root.position, [1730, 940])
+            self.assertEqual(app.save_calls, 0)
+            self.assertEqual(app._pending_drag_position, [1730, 940])
+
+            self.assertTrue(overlay.OverlayApp._check_display_topology(app, now=4.75))
+
+        self.assertEqual(app.settings["position"], [1730, 940])
+        self.assertEqual(app.save_calls, 1)
+        self.assertIsNone(app._pending_drag_position)
+
+    def test_repeated_same_fingerprint_reconciles_without_move_or_write(self):
+        laptop = self.laptop_monitor()
+        app = self.make_app(position=(100, 100), stable_monitors=[laptop])
+        app._native_display_dirty = True
+        app._native_display_dirty_at = 5.0
+
+        with mock.patch.object(overlay, "windows_monitor_work_areas", return_value=(laptop,)):
+            self.assertFalse(overlay.OverlayApp._check_display_topology(app, now=5.5))
+            self.assertTrue(overlay.OverlayApp._check_display_topology(app, now=5.75))
+            self.assertFalse(overlay.OverlayApp._check_display_topology(app, now=6.0))
+
+        self.assertEqual(app.root.position, [100, 100])
+        self.assertEqual(app.root.geometry_calls, [])
+        self.assertEqual(app.settings["position"], [100, 100])
+        self.assertEqual(app.save_calls, 0)
+
+    def test_null_position_uses_primary_work_area_without_becoming_persistent(self):
+        laptop = self.laptop_monitor()
+        app = self.make_app(position=(3895, 940), stable_monitors=[laptop])
+        app.settings["position"] = None
+
+        overlay.OverlayApp.reconcile_overlay_position(
+            app,
+            "startup",
+            candidate=None,
+            persist=True,
+            monitors=(laptop,),
+        )
+
+        self.assertEqual(app.root.position, [1718, 72])
+        self.assertIsNone(app.settings["position"])
+        self.assertEqual(app.save_calls, 0)
+
+    def test_larger_rendered_size_is_reclamped_and_persisted(self):
+        laptop = self.laptop_monitor()
+        app = self.make_app(position=(1730, 100), stable_monitors=[laptop])
+        app.root.size = (300, 80)
+
+        overlay.OverlayApp.reconcile_overlay_position(
+            app,
+            "render_size",
+            persist=True,
+            monitors=(laptop,),
+        )
+
+        self.assertEqual(app.root.position, [1620, 100])
+        self.assertEqual(app.settings["position"], [1620, 100])
+        self.assertEqual(app.save_calls, 1)
+
+    def test_changed_topology_closes_open_menu_before_recovery(self):
+        class FakeMenuWindow:
+            def __init__(self):
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+
+        laptop = self.laptop_monitor()
+        app = self.make_app(stable_monitors=[laptop, self.external_monitor()])
+        menu_window = FakeMenuWindow()
+        app.menu_active = True
+        app.menu_window = menu_window
+
+        with mock.patch.object(overlay, "windows_monitor_work_areas", return_value=(laptop,)):
+            self.assertFalse(overlay.OverlayApp._check_display_topology(app, now=7.0))
+            self.assertTrue(overlay.OverlayApp._check_display_topology(app, now=7.25))
+
+        self.assertEqual(menu_window.close_calls, 1)
+        self.assertFalse(app.menu_active)
+        self.assertIsNone(app.menu_window)
+        self.assertEqual(app.root.position, [1730, 940])
+
+
 class SingleInstanceLockTests(unittest.TestCase):
     def test_lock_blocks_second_live_instance(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1167,12 +2399,484 @@ class FakeRoot:
 class FakeProcessBackend:
     def __init__(self, should_show=True):
         self.should_show_result = should_show
+        self.calls = []
 
-    def should_show(self, _mode):
+    def should_show(self, mode):
+        self.calls.append(mode)
         return self.should_show_result
 
     def is_supported(self, _mode):
         return True
+
+
+class FakeSchedulerRoot(FakeRoot):
+    def __init__(self):
+        super().__init__()
+        self.after_callbacks = {}
+        self.after_delays = []
+        self.after_cancel_calls = []
+        self.deiconify_calls = 0
+        self.withdraw_calls = 0
+        self.events = []
+        self.destroyed = False
+        self._next_after_id = 0
+
+    def after(self, delay, callback):
+        self._next_after_id += 1
+        identifier = f"after-{self._next_after_id}"
+        self.after_callbacks[identifier] = callback
+        self.after_delays.append(delay)
+        return identifier
+
+    def after_cancel(self, identifier):
+        self.after_cancel_calls.append(identifier)
+        self.after_callbacks.pop(identifier, None)
+
+    def run_after(self, identifier):
+        callback = self.after_callbacks.pop(identifier)
+        callback()
+
+    def attributes(self, *args):
+        super().attributes(*args)
+        self.events.append(("attributes", args))
+
+    def deiconify(self):
+        super().deiconify()
+        self.deiconify_calls += 1
+        self.events.append(("deiconify", None))
+
+    def withdraw(self):
+        super().withdraw()
+        self.withdraw_calls += 1
+        self.events.append(("withdraw", None))
+
+    def destroy(self):
+        self.destroyed = True
+
+
+class FakeRefreshReader:
+    def __init__(self, events=None):
+        self.calls = []
+        self.last_error = None
+        self.events = events
+        self.batch = overlay.LogReadBatch(snapshot=None, token_events=[])
+
+    def read_updates(self, force_rescan=False, now=None):
+        self.calls.append((force_rescan, now))
+        if self.events is not None:
+            self.events.append(("read", force_rescan))
+        return self.batch
+
+
+class FakeRuntimeStateStore:
+    def __init__(self):
+        self.calls = []
+        self.deleted = False
+
+    def write(self, snapshot, counter, estimate):
+        self.calls.append((snapshot, counter.state_dict(), estimate))
+        return True
+
+    def delete(self):
+        self.deleted = True
+
+
+class AdaptiveRefreshLoopTests(unittest.TestCase):
+    def make_app(self, shown=True, should_show=True):
+        app = object.__new__(overlay.OverlayApp)
+        app.root = FakeSchedulerRoot()
+        app.settings = {"visibility_mode": "visible_window"}
+        app.process_backend = FakeProcessBackend(should_show)
+        app.reader = FakeRefreshReader(app.root.events)
+        app.runtime_state = FakeRuntimeStateStore()
+        app.token_counter = overlay.TokenCounter(reset_at=0)
+        app.detected_model = overlay.DetectedModel(None, "unknown")
+        app.counter_reset_model = None
+        app.last_model_check_at = 10**12
+        app.snapshot = None
+        app.force_rescan = False
+        app.menu_active = False
+        app.is_dragging = False
+        app.needs_render_after_menu = False
+        app.needs_render_after_drag = False
+        app.needs_visibility_after_menu = False
+        app._overlay_is_shown = shown
+        app._cached_should_show = None
+        app._last_visibility_check_at = 0.0
+        app._next_log_poll_at = 0.0
+        app._next_state_write_at = 0.0
+        app._next_display_poll_at = float("inf")
+        app._refresh_after_id = None
+        app._quitting = False
+        app._startup_complete = False
+        app._display_verification_after_id = None
+        app._display_verification_due_at = None
+        app._display_observer = None
+        app.render_calls = 0
+        app.request_render = lambda force=False: setattr(
+            app,
+            "render_calls",
+            app.render_calls + 1,
+        )
+        app.refresh_detected_model = lambda force=False: None
+        return app
+
+    def test_active_loop_uses_500ms_and_keeps_one_timer(self):
+        app = self.make_app(shown=True, should_show=True)
+        with mock.patch.object(overlay.time, "monotonic", return_value=100.0):
+            app.refresh()
+
+        self.assertEqual(len(app.reader.calls), 1)
+        self.assertEqual(len(app.runtime_state.calls), 1)
+        self.assertEqual(app.root.after_delays[-1], overlay.POLL_INTERVAL_MS)
+        self.assertEqual(len(app.root.after_callbacks), 1)
+
+        identifier = app._refresh_after_id
+        with mock.patch.object(overlay.time, "monotonic", return_value=100.5):
+            app.root.run_after(identifier)
+
+        self.assertEqual(len(app.reader.calls), 2)
+        self.assertEqual(len(app.runtime_state.calls), 1)
+        self.assertEqual(len(app.root.after_callbacks), 1)
+
+    def test_hidden_loop_uses_one_second_wake_and_five_second_data_poll(self):
+        app = self.make_app(shown=False, should_show=False)
+        with mock.patch.object(overlay.time, "monotonic", return_value=100.0):
+            app.refresh()
+
+        self.assertEqual(app.root.after_delays[-1], overlay.HIDDEN_POLL_INTERVAL_MS)
+        self.assertEqual(len(app.reader.calls), 1)
+        self.assertEqual(len(app.runtime_state.calls), 1)
+
+        with mock.patch.object(overlay.time, "monotonic", return_value=101.0):
+            app.refresh(schedule_next=False)
+        self.assertEqual(len(app.reader.calls), 1)
+        self.assertEqual(len(app.runtime_state.calls), 1)
+
+        with mock.patch.object(overlay.time, "monotonic", return_value=102.0):
+            app.refresh(schedule_next=False)
+        self.assertEqual(len(app.reader.calls), 1)
+        self.assertEqual(len(app.runtime_state.calls), 2)
+
+        with mock.patch.object(overlay.time, "monotonic", return_value=105.0):
+            app.refresh(schedule_next=False)
+        self.assertEqual(len(app.reader.calls), 2)
+
+    def test_process_visibility_is_checked_at_most_once_per_second(self):
+        app = self.make_app(shown=True, should_show=True)
+        app.settings["visibility_mode"] = "process"
+        for current in (100.0, 100.5, 101.0):
+            with mock.patch.object(overlay.time, "monotonic", return_value=current):
+                app.refresh(schedule_next=False)
+
+        self.assertEqual(app.process_backend.calls, ["process", "process"])
+        self.assertEqual(len(app.reader.calls), 3)
+
+    def test_always_visible_mode_skips_process_backend(self):
+        app = self.make_app(shown=True, should_show=True)
+        app.settings["visibility_mode"] = "always"
+        with mock.patch.object(overlay.time, "monotonic", return_value=100.0):
+            app.refresh(schedule_next=False)
+
+        self.assertEqual(app.process_backend.calls, [])
+
+    def test_hidden_to_visible_transition_catches_up_before_showing(self):
+        app = self.make_app(shown=False, should_show=False)
+        with mock.patch.object(overlay.time, "monotonic", return_value=100.0):
+            app.refresh(schedule_next=False)
+        app.root.events.clear()
+        app.process_backend.should_show_result = True
+
+        with (
+            mock.patch.object(overlay.time, "monotonic", return_value=101.0),
+            mock.patch.object(
+                overlay,
+                "windows_monitor_work_areas",
+                return_value=(),
+            ) as enumerate_monitors,
+        ):
+            app.refresh(schedule_next=False)
+
+        event_names = [event[0] for event in app.root.events]
+        self.assertEqual(event_names[:2], ["read", "deiconify"])
+        self.assertTrue(app._overlay_is_shown)
+        self.assertEqual(len(app.reader.calls), 2)
+        self.assertEqual(app.render_calls, 1)
+        self.assertEqual(enumerate_monitors.call_count, 1)
+
+    def test_manual_refresh_keeps_existing_timer_and_forces_reader(self):
+        app = self.make_app(shown=True, should_show=True)
+        with mock.patch.object(overlay.time, "monotonic", return_value=100.0):
+            app.refresh()
+        existing_timer = app._refresh_after_id
+        app._next_log_poll_at = 999.0
+
+        with mock.patch.object(overlay.time, "monotonic", return_value=100.1):
+            app.manual_refresh()
+
+        self.assertEqual(app.reader.calls[-1][0], True)
+        self.assertEqual(len(app.runtime_state.calls), 2)
+        self.assertEqual(app._refresh_after_id, existing_timer)
+        self.assertEqual(len(app.root.after_callbacks), 1)
+
+    def test_clean_display_topology_waits_for_fallback_deadline(self):
+        app = self.make_app()
+        app._stable_monitor_fingerprint = (("stable",),)
+        app._pending_monitor_fingerprint = None
+        app._native_display_dirty = False
+        app._display_reconcile_deferred = False
+        app._display_verification_due_at = None
+        app._next_display_poll_at = 10.0
+        app._consume_native_display_notifications = mock.Mock(return_value=False)
+        app._check_display_topology = mock.Mock(return_value=False)
+
+        self.assertFalse(app._check_display_topology_if_due(5.0))
+        app._check_display_topology.assert_not_called()
+        self.assertFalse(app._check_display_topology_if_due(10.0))
+        app._check_display_topology.assert_called_once_with(now=10.0)
+        self.assertEqual(
+            app._next_display_poll_at,
+            10.0 + overlay.DISPLAY_TOPOLOGY_POLL_INTERVAL_SECONDS,
+        )
+
+    def test_pending_display_sample_waits_for_sample_deadline(self):
+        app = self.make_app()
+        app._stable_monitor_fingerprint = (("stable",),)
+        app._pending_monitor_fingerprint = (("candidate",),)
+        app._pending_monitor_sample_count = 1
+        app._pending_monitor_last_seen_at = 10.0
+        app._native_display_dirty = False
+        app._display_reconcile_deferred = False
+        app._display_verification_due_at = None
+        app._last_display_scan_succeeded = True
+        app._next_display_poll_at = (
+            10.0 + overlay.DISPLAY_TOPOLOGY_SAMPLE_SECONDS
+        )
+        app._consume_native_display_notifications = mock.Mock(return_value=False)
+        app._check_display_topology = mock.Mock(return_value=False)
+
+        app._check_display_topology_if_due(10.1)
+        app._check_display_topology.assert_not_called()
+        app._check_display_topology_if_due(
+            10.0 + overlay.DISPLAY_TOPOLOGY_SAMPLE_SECONDS,
+        )
+        app._check_display_topology.assert_called_once()
+
+    def test_empty_display_scan_uses_bounded_retry_deadline(self):
+        app = self.make_app()
+        app._stable_monitor_fingerprint = (("stable",),)
+        app._pending_monitor_fingerprint = None
+        app._native_display_dirty = False
+        app._display_reconcile_deferred = False
+        app._display_verification_due_at = None
+        app._next_display_poll_at = 10.0
+        app._consume_native_display_notifications = mock.Mock(return_value=False)
+
+        def failed_scan(now):
+            app._last_display_scan_succeeded = False
+            return False
+
+        app._check_display_topology = mock.Mock(side_effect=failed_scan)
+        app._check_display_topology_if_due(10.0)
+        app._check_display_topology_if_due(10.5)
+        self.assertEqual(app._check_display_topology.call_count, 1)
+        app._check_display_topology_if_due(
+            10.0 + overlay.DISPLAY_TOPOLOGY_RETRY_SECONDS,
+        )
+        self.assertEqual(app._check_display_topology.call_count, 2)
+
+    def test_deferred_drag_reconciliation_does_not_scan_each_tick(self):
+        app = self.make_app()
+        app.is_dragging = True
+        app._stable_monitor_fingerprint = (("stable",),)
+        app._pending_monitor_fingerprint = (("candidate",),)
+        app._pending_monitor_sample_count = 2
+        app._pending_monitor_last_seen_at = 10.0
+        app._native_display_dirty = True
+        app._native_display_dirty_at = 9.0
+        app._display_reconcile_deferred = True
+        app._display_verification_due_at = None
+        app._last_display_scan_succeeded = True
+        app._next_display_poll_at = 10.0
+        app._consume_native_display_notifications = mock.Mock(return_value=False)
+        app._check_display_topology = mock.Mock(return_value=False)
+
+        app._check_display_topology_if_due(10.0)
+        app._check_display_topology_if_due(10.5)
+
+        app._check_display_topology.assert_called_once()
+        self.assertEqual(
+            app._next_display_poll_at,
+            10.0 + overlay.DISPLAY_TOPOLOGY_POLL_INTERVAL_SECONDS,
+        )
+
+    def test_runtime_heartbeat_is_inside_single_instance_stale_window(self):
+        self.assertLess(
+            overlay.RUNTIME_STATE_WRITE_INTERVAL_SECONDS,
+            overlay.INSTANCE_LOCK_HEARTBEAT_STALE_SECONDS,
+        )
+
+    def test_failed_runtime_write_retries_on_next_wake(self):
+        app = self.make_app(shown=True, should_show=True)
+        app.runtime_state.write = mock.Mock(side_effect=[False, True])
+
+        with mock.patch.object(overlay.time, "monotonic", return_value=100.0):
+            app.refresh(schedule_next=False)
+        self.assertEqual(app._next_state_write_at, 0.0)
+
+        with mock.patch.object(overlay.time, "monotonic", return_value=100.5):
+            app.refresh(schedule_next=False)
+
+        self.assertEqual(app.runtime_state.write.call_count, 2)
+        self.assertEqual(
+            app._next_state_write_at,
+            100.5 + overlay.RUNTIME_STATE_WRITE_INTERVAL_SECONDS,
+        )
+
+    def test_semantic_data_change_writes_state_before_heartbeat(self):
+        app = self.make_app(shown=True, should_show=True)
+        with mock.patch.object(overlay.time, "monotonic", return_value=100.0):
+            app.refresh(schedule_next=False)
+        self.assertEqual(len(app.runtime_state.calls), 1)
+
+        app.reader.batch = overlay.LogReadBatch(
+            snapshot=overlay.RateSnapshot(
+                timestamp="2026-07-28T12:00:00Z",
+                primary=overlay.RateWindow("5h", 300, 10, 90, None),
+                secondary=None,
+                plan_type="prolite",
+                rate_limit_reached_type=None,
+            ),
+            token_events=[],
+        )
+        with mock.patch.object(overlay.time, "monotonic", return_value=100.5):
+            app.refresh(schedule_next=False)
+
+        self.assertEqual(len(app.runtime_state.calls), 2)
+        self.assertEqual(
+            app._next_state_write_at,
+            100.5 + overlay.RUNTIME_STATE_WRITE_INTERVAL_SECONDS,
+        )
+
+    def test_five_minute_unchanged_schedule_bounds_writes_and_callbacks(self):
+        app = self.make_app(shown=True, should_show=True)
+        refresh_count = 5 * 60 * 1_000 // overlay.POLL_INTERVAL_MS
+
+        for index in range(refresh_count):
+            current = index * overlay.POLL_INTERVAL_MS / 1_000
+            with mock.patch.object(overlay.time, "monotonic", return_value=current):
+                app.refresh()
+
+        self.assertEqual(len(app.reader.calls), refresh_count)
+        self.assertLessEqual(
+            len(app.runtime_state.calls),
+            refresh_count // 4,
+        )
+        self.assertEqual(len(app.root.after_callbacks), 1)
+
+    def test_quit_cancels_owned_refresh_timer(self):
+        app = self.make_app()
+        with mock.patch.object(overlay.time, "monotonic", return_value=100.0):
+            app.refresh()
+        identifier = app._refresh_after_id
+
+        app.quit()
+
+        self.assertIn(identifier, app.root.after_cancel_calls)
+        self.assertEqual(app.root.after_callbacks, {})
+        self.assertTrue(app.runtime_state.deleted)
+        self.assertTrue(app.root.destroyed)
+
+
+class RenderAndVisibilityGatingTests(unittest.TestCase):
+    class FakeLabel:
+        instances = []
+
+        def __init__(self, *_args, **_kwargs):
+            self.destroyed = False
+            self.__class__.instances.append(self)
+
+        def grid(self, **_kwargs):
+            pass
+
+        def destroy(self):
+            self.destroyed = True
+
+    def make_render_app(self):
+        app = object.__new__(overlay.OverlayApp)
+        app.settings = {"layout_mode": "horizontal"}
+        app.labels = []
+        app.container = object()
+        app._force_render_requested = False
+        app._last_render_signature = None
+        app._last_overlay_size = (190, 40)
+        app._startup_complete = False
+        app.menu_active = False
+        app.is_dragging = False
+        app.needs_render_after_menu = False
+        app.needs_render_after_drag = False
+        app.display_widgets = lambda: [
+            overlay.DisplayWidget("primary", "5h 90%", overlay.COLOR_GREEN)
+        ]
+        app.current_window_size = lambda: (190, 40)
+        app._bind_window_events = lambda _widget: None
+        return app
+
+    def test_identical_render_signature_reuses_existing_labels(self):
+        app = self.make_render_app()
+        self.FakeLabel.instances = []
+        with mock.patch.object(overlay.tk, "Label", self.FakeLabel):
+            app.render()
+            first_label = app.labels[0]
+            app.render()
+
+        self.assertEqual(len(self.FakeLabel.instances), 1)
+        self.assertIs(app.labels[0], first_label)
+        self.assertFalse(first_label.destroyed)
+
+    def test_force_render_rebuilds_labels_and_menu_defers_only_changes(self):
+        app = self.make_render_app()
+        self.FakeLabel.instances = []
+        with mock.patch.object(overlay.tk, "Label", self.FakeLabel):
+            app.render()
+            first_label = app.labels[0]
+            app.menu_active = True
+            app.request_render()
+            self.assertFalse(app.needs_render_after_menu)
+            app.menu_active = False
+            app.request_render(force=True)
+
+        self.assertTrue(first_label.destroyed)
+        self.assertEqual(len(self.FakeLabel.instances), 2)
+
+    def test_visibility_calls_tk_only_on_transitions(self):
+        app = object.__new__(overlay.OverlayApp)
+        app.root = FakeSchedulerRoot()
+        app.settings = {"visibility_mode": "visible_window"}
+        app.process_backend = FakeProcessBackend()
+        app.menu_active = False
+        app.needs_visibility_after_menu = False
+        app._overlay_is_shown = False
+        app._cached_should_show = None
+        app._last_visibility_check_at = 0.0
+        app._stable_monitor_fingerprint = None
+        app.reconcile_overlay_position = lambda *_args, **_kwargs: False
+
+        with mock.patch.object(overlay, "windows_monitor_work_areas", return_value=()):
+            app.update_visibility(should_show=False)
+            app.update_visibility(should_show=False)
+            app.update_visibility(should_show=True)
+            app.update_visibility(should_show=True)
+            app.update_visibility(force=True, should_show=True)
+            app.update_visibility(should_show=False)
+            app.update_visibility(should_show=False)
+
+        self.assertEqual(app.root.deiconify_calls, 1)
+        self.assertEqual(app.root.withdraw_calls, 1)
+        self.assertEqual(
+            app.root.attribute_calls.count(("-topmost", True)),
+            1,
+        )
 
 
 class MenuInteractionTests(unittest.TestCase):

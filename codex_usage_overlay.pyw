@@ -28,7 +28,7 @@ from typing import Any, Callable
 
 
 APP_NAME = "Codex Usage Overlay"
-APP_VERSION = "0.1.8"
+APP_VERSION = "0.1.9"
 SETTINGS_FILE_NAME = "codex_usage_overlay.settings.json"
 RUNTIME_STATE_FILE_NAME = "codex-usage-overlay-state.json"
 INSTANCE_LOCK_FILE_NAME = "codex-usage-overlay.lock"
@@ -43,9 +43,20 @@ WINDOWS_CHATGPT_PROCESS_NAME = "chatgpt.exe"
 WINDOWS_CODEX_PACKAGE_PREFIX = "openai.codex_"
 DEFAULT_OPACITY = 0.9
 POLL_INTERVAL_MS = 500
+HIDDEN_POLL_INTERVAL_MS = 1_000
+HIDDEN_LOG_POLL_INTERVAL_SECONDS = 5
+PROCESS_VISIBILITY_POLL_INTERVAL_SECONDS = 1
+RUNTIME_STATE_WRITE_INTERVAL_SECONDS = 2
+SESSION_FULL_RESCAN_INTERVAL_SECONDS = 30
+SQLITE_FALLBACK_PROBE_INTERVAL_SECONDS = 5
+DISPLAY_TOPOLOGY_POLL_INTERVAL_SECONDS = 5
 MIN_VISIBLE_PIXELS = 24
 DEFAULT_OVERLAY_WIDTH = 190
 DEFAULT_OVERLAY_HEIGHT = 40
+DISPLAY_TOPOLOGY_SAMPLE_SECONDS = 0.25
+DISPLAY_TOPOLOGY_DEBOUNCE_SECONDS = 0.5
+DISPLAY_TOPOLOGY_RETRY_SECONDS = 1
+DISPLAY_TOPOLOGY_VERIFY_MS = 1_000
 INSTANCE_LOCK_STARTUP_GRACE_SECONDS = 10
 INSTANCE_LOCK_HEARTBEAT_STALE_SECONDS = 5
 MAX_SESSION_FILES_TO_SCAN = 10
@@ -177,6 +188,14 @@ class ApiCostEstimate:
     long_context_request_count: int = 0
     cache_write_cost: float | None = None
     warning: str | None = None
+
+
+@dataclass(frozen=True)
+class MonitorWorkArea:
+    device_name: str
+    monitor_bounds: tuple[int, int, int, int]
+    work_area: tuple[int, int, int, int]
+    is_primary: bool = False
 
 
 @dataclass(frozen=True)
@@ -877,27 +896,120 @@ class SqliteRateLimitReader:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.last_error: str | None = None
+        self._last_snapshot: RateSnapshot | None = None
+        self._last_row_id: int | None = None
+        self._database_identity: tuple[int, int] | None = None
+        self._database_signature: tuple[tuple[int, int] | None, ...] | None = None
+        self._last_probe_at = 0.0
 
-    def latest_snapshot(self, row_limit: int = SQLITE_RATE_ROWS_TO_SCAN) -> RateSnapshot | None:
+    @staticmethod
+    def _path_signature(path: Path) -> tuple[int, int] | None:
+        try:
+            stat_result = path.stat()
+        except OSError:
+            return None
+        return (int(stat_result.st_size), int(stat_result.st_mtime_ns))
+
+    def _current_database_signature(self) -> tuple[tuple[int, int] | None, ...]:
+        return tuple(
+            self._path_signature(Path(f"{self.path}{suffix}"))
+            for suffix in ("", "-wal", "-shm")
+        )
+
+    def _current_database_identity(self) -> tuple[int, int] | None:
+        try:
+            stat_result = self.path.stat()
+        except OSError:
+            return None
+        file_identifier = int(stat_result.st_ino)
+        if file_identifier == 0:
+            file_identifier = int(stat_result.st_ctime_ns)
+        return (int(stat_result.st_dev), file_identifier)
+
+    def latest_snapshot(
+        self,
+        row_limit: int = SQLITE_RATE_ROWS_TO_SCAN,
+        force_rescan: bool = False,
+        now: float | None = None,
+    ) -> RateSnapshot | None:
         self.last_error = None
         if not self.path.exists():
             return None
+
+        observed_at = time.monotonic() if now is None else now
+        database_signature = self._current_database_signature()
+        database_identity = self._current_database_identity()
+        signature_changed = database_signature != self._database_signature
+        fallback_probe_due = (
+            self._last_row_id is None
+            or observed_at - self._last_probe_at >= SQLITE_FALLBACK_PROBE_INTERVAL_SECONDS
+        )
+        if (
+            not force_rescan
+            and self._last_row_id is not None
+            and not signature_changed
+            and not fallback_probe_due
+        ):
+            return self._last_snapshot
 
         connection = None
         try:
             uri = self.path.resolve().as_uri() + "?mode=ro"
             connection = sqlite3.connect(uri, uri=True, timeout=0.2)
-            rows = connection.execute(
-                """
-                SELECT id, ts, target, feedback_log_body
-                FROM logs
-                WHERE feedback_log_body LIKE ?
-                  AND feedback_log_body LIKE ?
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (f"%{SQLITE_RATE_LOG_MARKER}%", f"%{SQLITE_RATE_EVENT_TYPE}%", row_limit),
+            max_row = connection.execute("SELECT MAX(id) FROM logs").fetchone()
+            max_row_id = parse_int(max_row[0] if max_row else 0)
+            database_replaced = (
+                self._database_identity is not None
+                and database_identity is not None
+                and database_identity != self._database_identity
             )
+            row_id_rolled_back = (
+                self._last_row_id is not None and max_row_id < self._last_row_id
+            )
+            full_rescan = (
+                force_rescan
+                or self._last_row_id is None
+                or database_replaced
+                or row_id_rolled_back
+            )
+
+            if full_rescan:
+                rows = connection.execute(
+                    """
+                    SELECT id, ts, target, feedback_log_body
+                    FROM logs
+                    WHERE feedback_log_body LIKE ?
+                      AND feedback_log_body LIKE ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (
+                        f"%{SQLITE_RATE_LOG_MARKER}%",
+                        f"%{SQLITE_RATE_EVENT_TYPE}%",
+                        row_limit,
+                    ),
+                )
+            elif max_row_id > self._last_row_id:
+                rows = connection.execute(
+                    """
+                    SELECT id, ts, target, feedback_log_body
+                    FROM logs
+                    WHERE id > ?
+                      AND feedback_log_body LIKE ?
+                      AND feedback_log_body LIKE ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (
+                        self._last_row_id,
+                        f"%{SQLITE_RATE_LOG_MARKER}%",
+                        f"%{SQLITE_RATE_EVENT_TYPE}%",
+                        row_limit,
+                    ),
+                )
+            else:
+                rows = ()
+
             snapshots: list[RateSnapshot] = []
             for row_id, observed_at, target, body in rows:
                 if target != "codex_api::endpoint::responses_websocket":
@@ -910,12 +1022,24 @@ class SqliteRateLimitReader:
                 snapshot = parse_sqlite_rate_limit_log_body(body, observed_float, source_path)
                 if snapshot is not None:
                     snapshots.append(snapshot)
-            if not snapshots:
-                return None
-            return max(snapshots, key=timestamp_sort_key)
+            if snapshots:
+                newest = max(snapshots, key=timestamp_sort_key)
+                if (
+                    self._last_snapshot is None
+                    or timestamp_sort_key(newest) >= timestamp_sort_key(self._last_snapshot)
+                ):
+                    self._last_snapshot = newest
+
+            self._last_row_id = max_row_id
+            self._database_identity = database_identity
+            self._database_signature = database_signature
+            self._last_probe_at = (
+                time.monotonic() if now is None else now
+            )
+            return self._last_snapshot
         except (OSError, sqlite3.Error, ValueError) as exc:
             self.last_error = str(exc)
-            return None
+            return self._last_snapshot
         finally:
             if connection is not None:
                 connection.close()
@@ -929,12 +1053,21 @@ class RateLogReader:
         self._offsets: dict[Path, int] = {}
         self._partials: dict[Path, str] = {}
         self._last_snapshot: RateSnapshot | None = None
+        self._last_full_session_scan_at: float | None = None
         self.last_error: str | None = None
 
-    def read_updates(self, force_rescan: bool = False) -> LogReadBatch:
+    def read_updates(
+        self,
+        force_rescan: bool = False,
+        now: float | None = None,
+    ) -> LogReadBatch:
         try:
             self.last_error = None
-            self._session_files = self._find_session_files()
+            observed_at = time.monotonic() if now is None else now
+            self._session_files = self._refresh_session_files(
+                force_rescan=force_rescan,
+                now=observed_at,
+            )
             active_files = self._session_files[:MAX_SESSION_FILES_TO_SCAN]
             self._prune_tracking({path for path, _stat_result in active_files})
 
@@ -945,7 +1078,10 @@ class RateLogReader:
                 snapshots.extend(parse_rate_snapshots_from_text(text, str(path)))
                 token_events.extend(parse_token_events_from_text(text, str(path)))
 
-            sqlite_snapshot = self.sqlite_reader.latest_snapshot()
+            sqlite_snapshot = self.sqlite_reader.latest_snapshot(
+                force_rescan=force_rescan,
+                now=observed_at,
+            )
             if sqlite_snapshot is not None:
                 snapshots.append(sqlite_snapshot)
 
@@ -958,8 +1094,68 @@ class RateLogReader:
             self.last_error = str(exc)
             return LogReadBatch(snapshot=self._last_snapshot, token_events=[])
 
-    def latest_snapshot(self, force_rescan: bool = False) -> RateSnapshot | None:
-        return self.read_updates(force_rescan=force_rescan).snapshot
+    def latest_snapshot(
+        self,
+        force_rescan: bool = False,
+        now: float | None = None,
+    ) -> RateSnapshot | None:
+        return self.read_updates(force_rescan=force_rescan, now=now).snapshot
+
+    def _refresh_session_files(
+        self,
+        force_rescan: bool,
+        now: float,
+    ) -> list[tuple[Path, os.stat_result]]:
+        sessions_dir = self.codex_home / "sessions"
+        if not sessions_dir.exists():
+            self.last_error = f"Missing sessions folder: {sessions_dir}"
+            return []
+
+        full_rescan_due = (
+            force_rescan
+            or self._last_full_session_scan_at is None
+            or now - self._last_full_session_scan_at >= SESSION_FULL_RESCAN_INTERVAL_SECONDS
+        )
+        if full_rescan_due:
+            files = self._find_session_files()
+            self._last_full_session_scan_at = now
+            return files[:MAX_SESSION_FILES_TO_SCAN]
+
+        candidates: dict[Path, os.stat_result] = {}
+        for path, _old_stat in self._session_files[:MAX_SESSION_FILES_TO_SCAN]:
+            try:
+                candidates[path] = path.stat()
+            except OSError:
+                continue
+
+        hot_directories = {
+            path.parent
+            for path, _stat_result in self._session_files[:MAX_SESSION_FILES_TO_SCAN]
+        }
+        for current in (datetime.now(), datetime.now(timezone.utc)):
+            hot_directories.add(
+                sessions_dir
+                / f"{current.year:04d}"
+                / f"{current.month:02d}"
+                / f"{current.day:02d}"
+            )
+
+        for directory in hot_directories:
+            try:
+                paths = directory.glob("*.jsonl")
+                for path in paths:
+                    try:
+                        candidates[path] = path.stat()
+                    except OSError:
+                        continue
+            except OSError:
+                continue
+
+        return sorted(
+            candidates.items(),
+            key=lambda item: item[1].st_mtime,
+            reverse=True,
+        )[:MAX_SESSION_FILES_TO_SCAN]
 
     def _find_session_files(self) -> list[tuple[Path, os.stat_result]]:
         sessions_dir = self.codex_home / "sessions"
@@ -1221,6 +1417,229 @@ def normalize_overlay_position(
     return default_overlay_position(bounds, window_size)
 
 
+def bounds_edges(bounds: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    left, top, width, height = bounds
+    return (left, top, left + max(0, width), top + max(0, height))
+
+
+def overlay_bounds(
+    position: list[int] | tuple[int, int],
+    window_size: tuple[int, int] | None = None,
+) -> tuple[int, int, int, int]:
+    width, height = normalize_window_size(window_size)
+    return (int(position[0]), int(position[1]), width, height)
+
+
+def bounds_contains(
+    container: tuple[int, int, int, int],
+    item: tuple[int, int, int, int],
+) -> bool:
+    container_left, container_top, container_right, container_bottom = bounds_edges(
+        container
+    )
+    item_left, item_top, item_right, item_bottom = bounds_edges(item)
+    return (
+        item_left >= container_left
+        and item_top >= container_top
+        and item_right <= container_right
+        and item_bottom <= container_bottom
+    )
+
+
+def bounds_intersection_size(
+    first: tuple[int, int, int, int],
+    second: tuple[int, int, int, int],
+) -> tuple[int, int]:
+    first_left, first_top, first_right, first_bottom = bounds_edges(first)
+    second_left, second_top, second_right, second_bottom = bounds_edges(second)
+    return (
+        max(0, min(first_right, second_right) - max(first_left, second_left)),
+        max(0, min(first_bottom, second_bottom) - max(first_top, second_top)),
+    )
+
+
+def bounds_distance_squared(
+    first: tuple[int, int, int, int],
+    second: tuple[int, int, int, int],
+) -> int:
+    first_left, first_top, first_right, first_bottom = bounds_edges(first)
+    second_left, second_top, second_right, second_bottom = bounds_edges(second)
+    horizontal_gap = max(first_left - second_right, second_left - first_right, 0)
+    vertical_gap = max(first_top - second_bottom, second_top - first_bottom, 0)
+    return horizontal_gap * horizontal_gap + vertical_gap * vertical_gap
+
+
+def _valid_monitor_work_areas(
+    monitors: list[MonitorWorkArea] | tuple[MonitorWorkArea, ...],
+) -> list[MonitorWorkArea]:
+    return [
+        monitor
+        for monitor in monitors
+        if monitor.monitor_bounds[2] > 0
+        and monitor.monitor_bounds[3] > 0
+        and monitor.work_area[2] > 0
+        and monitor.work_area[3] > 0
+    ]
+
+
+def _monitor_tie_key(monitor: MonitorWorkArea) -> tuple[Any, ...]:
+    return (
+        0 if monitor.is_primary else 1,
+        monitor.device_name.casefold(),
+        monitor.work_area,
+        monitor.monitor_bounds,
+    )
+
+
+def primary_monitor_work_area(
+    monitors: list[MonitorWorkArea] | tuple[MonitorWorkArea, ...],
+) -> MonitorWorkArea | None:
+    valid = _valid_monitor_work_areas(monitors)
+    if not valid:
+        return None
+    return min(valid, key=_monitor_tie_key)
+
+
+def choose_monitor_for_overlay(
+    position: list[int] | tuple[int, int],
+    window_size: tuple[int, int] | None,
+    monitors: list[MonitorWorkArea] | tuple[MonitorWorkArea, ...],
+) -> MonitorWorkArea | None:
+    valid = _valid_monitor_work_areas(monitors)
+    if not valid:
+        return None
+
+    rectangle = overlay_bounds(position, window_size)
+    width, height = normalize_window_size(window_size)
+    minimum_width = min(MIN_VISIBLE_PIXELS, width)
+    minimum_height = min(MIN_VISIBLE_PIXELS, height)
+
+    contained = [monitor for monitor in valid if bounds_contains(monitor.work_area, rectangle)]
+    if contained:
+        return min(contained, key=_monitor_tie_key)
+
+    work_intersections: list[tuple[int, MonitorWorkArea]] = []
+    for monitor in valid:
+        intersection_width, intersection_height = bounds_intersection_size(
+            rectangle,
+            monitor.work_area,
+        )
+        if intersection_width >= minimum_width and intersection_height >= minimum_height:
+            work_intersections.append((intersection_width * intersection_height, monitor))
+    if work_intersections:
+        greatest_area = max(area for area, _monitor in work_intersections)
+        return min(
+            (monitor for area, monitor in work_intersections if area == greatest_area),
+            key=_monitor_tie_key,
+        )
+
+    monitor_intersections: list[tuple[int, MonitorWorkArea]] = []
+    for monitor in valid:
+        intersection_width, intersection_height = bounds_intersection_size(
+            rectangle,
+            monitor.monitor_bounds,
+        )
+        area = intersection_width * intersection_height
+        if area > 0:
+            monitor_intersections.append((area, monitor))
+    if monitor_intersections:
+        greatest_area = max(area for area, _monitor in monitor_intersections)
+        return min(
+            (monitor for area, monitor in monitor_intersections if area == greatest_area),
+            key=_monitor_tie_key,
+        )
+
+    nearest_distance = min(
+        bounds_distance_squared(rectangle, monitor.work_area) for monitor in valid
+    )
+    return min(
+        (
+            monitor
+            for monitor in valid
+            if bounds_distance_squared(rectangle, monitor.work_area) == nearest_distance
+        ),
+        key=_monitor_tie_key,
+    )
+
+
+def normalize_overlay_position_for_monitors(
+    value: Any,
+    monitors: list[MonitorWorkArea] | tuple[MonitorWorkArea, ...],
+    window_size: tuple[int, int] | None = None,
+) -> list[int] | None:
+    valid = _valid_monitor_work_areas(monitors)
+    if not valid:
+        return None
+
+    if (
+        isinstance(value, (list, tuple))
+        and len(value) == 2
+        and all(isinstance(item, int) for item in value)
+    ):
+        requested = [int(value[0]), int(value[1])]
+        monitor = choose_monitor_for_overlay(requested, window_size, valid)
+        if monitor is None:
+            return None
+        if bounds_contains(monitor.work_area, overlay_bounds(requested, window_size)):
+            return requested
+        return clamp_overlay_position(requested, monitor.work_area, window_size)
+
+    monitor = primary_monitor_work_area(valid)
+    if monitor is None:
+        return None
+    return default_overlay_position(monitor.work_area, window_size)
+
+
+def monitor_topology_fingerprint(
+    monitors: list[MonitorWorkArea] | tuple[MonitorWorkArea, ...],
+) -> tuple[tuple[Any, ...], ...]:
+    return tuple(
+        sorted(
+            (
+                monitor.device_name.casefold(),
+                monitor.monitor_bounds,
+                monitor.work_area,
+                bool(monitor.is_primary),
+            )
+            for monitor in _valid_monitor_work_areas(monitors)
+        )
+    )
+
+
+WM_SETTINGCHANGE = 0x001A
+WM_DISPLAYCHANGE = 0x007E
+WM_NCDESTROY = 0x0082
+WM_POWERBROADCAST = 0x0218
+WM_DEVICECHANGE = 0x0219
+WM_DPICHANGED = 0x02E0
+SPI_SETWORKAREA = 0x002F
+DBT_DEVNODES_CHANGED = 0x0007
+DBT_CONFIGCHANGED = 0x0018
+PBT_APMRESUMECRITICAL = 0x0006
+PBT_APMRESUMESUSPEND = 0x0007
+PBT_APMRESUMEAUTOMATIC = 0x0012
+
+
+def is_display_reconcile_message(message: int, wparam: int = 0) -> bool:
+    if message in (WM_DISPLAYCHANGE, WM_DPICHANGED):
+        return True
+    if message == WM_SETTINGCHANGE:
+        # Shell and taskbar implementations are not uniform about wParam. A
+        # fingerprint comparison makes unrelated setting notifications cheap.
+        return True
+    if message == WM_DEVICECHANGE:
+        # Arrival/removal broadcasts are also useful hints. The later monitor
+        # fingerprint comparison filters device changes unrelated to displays.
+        return True
+    if message == WM_POWERBROADCAST:
+        return wparam in (
+            PBT_APMRESUMECRITICAL,
+            PBT_APMRESUMESUSPEND,
+            PBT_APMRESUMEAUTOMATIC,
+        )
+    return False
+
+
 def windows_virtual_screen_bounds() -> tuple[int, int, int, int] | None:
     if platform.system() != "Windows":
         return None
@@ -1245,9 +1664,152 @@ class WindowsMonitorInfo(ctypes.Structure):
     ]
 
 
+class WindowsMonitorInfoEx(ctypes.Structure):
+    _fields_ = WindowsMonitorInfo._fields_ + [
+        ("szDevice", ctypes.wintypes.WCHAR * 32),
+    ]
+
+
+class WindowsDisplayDevice(ctypes.Structure):
+    _fields_ = [
+        ("cb", ctypes.wintypes.DWORD),
+        ("DeviceName", ctypes.wintypes.WCHAR * 32),
+        ("DeviceString", ctypes.wintypes.WCHAR * 128),
+        ("StateFlags", ctypes.wintypes.DWORD),
+        ("DeviceID", ctypes.wintypes.WCHAR * 128),
+        ("DeviceKey", ctypes.wintypes.WCHAR * 128),
+    ]
+
+
+def _windows_active_display_device_names(user32: Any) -> set[str] | None:
+    attached_to_desktop = 0x00000001
+    mirroring_driver = 0x00000008
+    try:
+        user32.EnumDisplayDevicesW.argtypes = [
+            ctypes.wintypes.LPCWSTR,
+            ctypes.wintypes.DWORD,
+            ctypes.POINTER(WindowsDisplayDevice),
+            ctypes.wintypes.DWORD,
+        ]
+        user32.EnumDisplayDevicesW.restype = ctypes.wintypes.BOOL
+        devices: set[str] = set()
+        for index in range(64):
+            device = WindowsDisplayDevice()
+            device.cb = ctypes.sizeof(WindowsDisplayDevice)
+            if not user32.EnumDisplayDevicesW(None, index, ctypes.byref(device), 0):
+                break
+            flags = int(device.StateFlags)
+            name = str(device.DeviceName).casefold()
+            if name and flags & attached_to_desktop and not flags & mirroring_driver:
+                devices.add(name)
+        return devices or None
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def windows_monitor_work_areas() -> tuple[MonitorWorkArea, ...]:
+    if platform.system() != "Windows":
+        return ()
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        active_devices = _windows_active_display_device_names(user32)
+        if not active_devices:
+            return ()
+        callback_factory = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
+        callback_type = callback_factory(
+            ctypes.wintypes.BOOL,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.wintypes.RECT),
+            ctypes.wintypes.LPARAM,
+        )
+        monitors: list[MonitorWorkArea] = []
+        seen: set[tuple[Any, ...]] = set()
+        callback_errors: list[BaseException] = []
+
+        def collect_monitor(
+            monitor_handle: int,
+            _device_context: int,
+            _monitor_rect: ctypes.POINTER(ctypes.wintypes.RECT),
+            _data: int,
+        ) -> bool:
+            try:
+                info = WindowsMonitorInfoEx()
+                info.cbSize = ctypes.sizeof(WindowsMonitorInfoEx)
+                if not user32.GetMonitorInfoW(monitor_handle, ctypes.byref(info)):
+                    callback_errors.append(OSError("GetMonitorInfoW failed"))
+                    return False
+                monitor_rect = info.rcMonitor
+                work_rect = info.rcWork
+                monitor_bounds = (
+                    int(monitor_rect.left),
+                    int(monitor_rect.top),
+                    int(monitor_rect.right - monitor_rect.left),
+                    int(monitor_rect.bottom - monitor_rect.top),
+                )
+                work_area = (
+                    int(work_rect.left),
+                    int(work_rect.top),
+                    int(work_rect.right - work_rect.left),
+                    int(work_rect.bottom - work_rect.top),
+                )
+                device_name = str(info.szDevice)
+                normalized_device_name = device_name.casefold()
+                if normalized_device_name not in active_devices:
+                    return True
+                if monitor_bounds[2] <= 0 or monitor_bounds[3] <= 0:
+                    callback_errors.append(ValueError("Invalid active monitor rectangle"))
+                    return False
+                if work_area[2] <= 0 or work_area[3] <= 0:
+                    callback_errors.append(ValueError("Invalid active monitor work area"))
+                    return False
+                identity = (normalized_device_name, monitor_bounds, work_area)
+                if identity in seen:
+                    return True
+                seen.add(identity)
+                monitors.append(
+                    MonitorWorkArea(
+                        device_name=device_name,
+                        monitor_bounds=monitor_bounds,
+                        work_area=work_area,
+                        is_primary=bool(int(info.dwFlags) & 1),
+                    )
+                )
+                return True
+            except BaseException as exc:
+                callback_errors.append(exc)
+                return False
+
+        callback = callback_type(collect_monitor)
+        user32.GetMonitorInfoW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(WindowsMonitorInfoEx),
+        ]
+        user32.GetMonitorInfoW.restype = ctypes.wintypes.BOOL
+        user32.EnumDisplayMonitors.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.wintypes.RECT),
+            callback_type,
+            ctypes.wintypes.LPARAM,
+        ]
+        user32.EnumDisplayMonitors.restype = ctypes.wintypes.BOOL
+        if not user32.EnumDisplayMonitors(None, None, callback, 0) or callback_errors:
+            return ()
+        expected_monitor_count = int(user32.GetSystemMetrics(80))
+        if expected_monitor_count <= 0 or len(monitors) != expected_monitor_count:
+            return ()
+        return tuple(sorted(monitors, key=_monitor_tie_key))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return ()
+
+
 def windows_monitor_work_area(position: list[int] | tuple[int, int]) -> tuple[int, int, int, int] | None:
     if platform.system() != "Windows":
         return None
+    monitors = windows_monitor_work_areas()
+    selected = choose_monitor_for_overlay(position, (1, 1), monitors)
+    if selected is not None:
+        return selected.work_area
     try:
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         user32.MonitorFromPoint.argtypes = [ctypes.wintypes.POINT, ctypes.wintypes.DWORD]
@@ -1270,6 +1832,197 @@ def windows_monitor_work_area(position: list[int] | tuple[int, int]) -> tuple[in
         return (int(rect.left), int(rect.top), width, height)
     except (OSError, AttributeError, TypeError, ValueError):
         return None
+
+
+class WindowsDisplayChangeObserver:
+    """Best-effort observer; native callbacks only record display hints."""
+
+    SUBCLASS_ID = 0x434F4458
+    GA_ROOT = 2
+
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self._hwnd = 0
+        self._closing = False
+        self._pending: set[tuple[int, int]] = set()
+        self._callback_error: BaseException | None = None
+        self._user32: Any = None
+        self._comctl32: Any = None
+        self._kernel32: Any = None
+        self._proc_type: Any = None
+        self._proc: Any = None
+
+        if platform.system() != "Windows":
+            return
+        try:
+            self._initialize_native_api()
+            self.root.bind("<Map>", self._on_map, add="+")
+            self.root.after_idle(self.install_if_mapped)
+        except (AttributeError, OSError, TypeError, tk.TclError):
+            self._user32 = None
+            self._comctl32 = None
+            self._kernel32 = None
+            self._proc = None
+
+    def _initialize_native_api(self) -> None:
+        self._user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self._comctl32 = ctypes.WinDLL("comctl32", use_last_error=True)
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        callback_factory = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
+        self._proc_type = callback_factory(
+            ctypes.c_ssize_t,
+            ctypes.wintypes.HWND,
+            ctypes.wintypes.UINT,
+            ctypes.c_size_t,
+            ctypes.c_ssize_t,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+        )
+        self._proc = self._proc_type(self._subclass_proc)
+
+        self._comctl32.SetWindowSubclass.argtypes = [
+            ctypes.wintypes.HWND,
+            self._proc_type,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+        ]
+        self._comctl32.SetWindowSubclass.restype = ctypes.wintypes.BOOL
+        self._comctl32.DefSubclassProc.argtypes = [
+            ctypes.wintypes.HWND,
+            ctypes.wintypes.UINT,
+            ctypes.c_size_t,
+            ctypes.c_ssize_t,
+        ]
+        self._comctl32.DefSubclassProc.restype = ctypes.c_ssize_t
+        self._comctl32.RemoveWindowSubclass.argtypes = [
+            ctypes.wintypes.HWND,
+            self._proc_type,
+            ctypes.c_size_t,
+        ]
+        self._comctl32.RemoveWindowSubclass.restype = ctypes.wintypes.BOOL
+        self._user32.GetAncestor.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.UINT]
+        self._user32.GetAncestor.restype = ctypes.wintypes.HWND
+        self._user32.IsWindow.argtypes = [ctypes.wintypes.HWND]
+        self._user32.IsWindow.restype = ctypes.wintypes.BOOL
+        self._user32.GetWindowThreadProcessId.argtypes = [
+            ctypes.wintypes.HWND,
+            ctypes.POINTER(ctypes.wintypes.DWORD),
+        ]
+        self._user32.GetWindowThreadProcessId.restype = ctypes.wintypes.DWORD
+        self._kernel32.GetCurrentThreadId.argtypes = []
+        self._kernel32.GetCurrentThreadId.restype = ctypes.wintypes.DWORD
+
+    @staticmethod
+    def _handle_value(value: Any) -> int:
+        return int(getattr(value, "value", value) or 0)
+
+    @staticmethod
+    def _parse_handle(value: Any) -> int:
+        text = str(value).strip()
+        return int(text, 16) if text.lower().startswith("0x") else int(text, 10)
+
+    def _wrapper_handle(self) -> int:
+        raw_handle = self.root.tk.call("wm", "frame", self.root._w)
+        candidate = self._parse_handle(raw_handle)
+        root_handle = self._user32.GetAncestor(ctypes.wintypes.HWND(candidate), self.GA_ROOT)
+        return self._handle_value(root_handle) or candidate
+
+    def _on_map(self, event: tk.Event) -> None:
+        if getattr(event, "widget", self.root) is self.root and not self._closing:
+            self.root.after_idle(self.install_if_mapped)
+
+    def install_if_mapped(self) -> bool:
+        if self._closing or self._proc is None or self._user32 is None:
+            return False
+        try:
+            if not self.root.winfo_exists() or not self.root.winfo_ismapped():
+                return False
+            hwnd = self._wrapper_handle()
+            if not hwnd or not self._user32.IsWindow(ctypes.wintypes.HWND(hwnd)):
+                return False
+            if hwnd == self._hwnd:
+                return True
+            owner_thread = int(
+                self._user32.GetWindowThreadProcessId(ctypes.wintypes.HWND(hwnd), None)
+            )
+            if owner_thread != int(self._kernel32.GetCurrentThreadId()):
+                return False
+            if self._hwnd and not self.detach():
+                return False
+            installed = bool(
+                self._comctl32.SetWindowSubclass(
+                    ctypes.wintypes.HWND(hwnd),
+                    self._proc,
+                    ctypes.c_size_t(self.SUBCLASS_ID),
+                    ctypes.c_size_t(0),
+                )
+            )
+            if installed:
+                self._hwnd = hwnd
+            return installed
+        except (AttributeError, OSError, TypeError, ValueError, tk.TclError):
+            return False
+
+    def _subclass_proc(
+        self,
+        hwnd: int,
+        message: int,
+        wparam: int,
+        lparam: int,
+        _subclass_id: int,
+        _reference_data: int,
+    ) -> int:
+        try:
+            message_value = int(message)
+            wparam_value = int(wparam)
+            if message_value == WM_NCDESTROY:
+                self._comctl32.RemoveWindowSubclass(
+                    hwnd,
+                    self._proc,
+                    ctypes.c_size_t(self.SUBCLASS_ID),
+                )
+                if self._hwnd == self._handle_value(hwnd):
+                    self._hwnd = 0
+            elif is_display_reconcile_message(message_value, wparam_value):
+                self._pending.add((message_value, wparam_value))
+        except BaseException as exc:
+            # Exceptions must never cross a native callback boundary.
+            self._callback_error = exc
+        return int(self._comctl32.DefSubclassProc(hwnd, message, wparam, lparam))
+
+    def take_pending(self) -> set[tuple[int, int]]:
+        pending = self._pending
+        self._pending = set()
+        return pending
+
+    def take_callback_error(self) -> BaseException | None:
+        error = self._callback_error
+        self._callback_error = None
+        return error
+
+    def detach(self) -> bool:
+        if not self._hwnd:
+            return True
+        try:
+            hwnd = ctypes.wintypes.HWND(self._hwnd)
+            if self._user32.IsWindow(hwnd):
+                removed = bool(
+                    self._comctl32.RemoveWindowSubclass(
+                        hwnd,
+                        self._proc,
+                        ctypes.c_size_t(self.SUBCLASS_ID),
+                    )
+                )
+                if not removed:
+                    return False
+            self._hwnd = 0
+            return True
+        except (AttributeError, OSError, TypeError, ValueError):
+            return False
+
+    def close_before_root_destroy(self) -> bool:
+        self._closing = True
+        return self.detach()
 
 
 def settings_path() -> Path:
@@ -1715,7 +2468,7 @@ class RuntimeStateStore:
         snapshot: RateSnapshot | None,
         counter: TokenCounter,
         api_cost_estimate: ApiCostEstimate | None = None,
-    ) -> None:
+    ) -> bool:
         now = time.time()
         state = {
             "app": APP_NAME,
@@ -1737,8 +2490,9 @@ class RuntimeStateStore:
                 json.dump(state, handle, indent=2, sort_keys=True)
                 handle.write("\n")
             temp_path.replace(self.path)
+            return True
         except OSError:
-            pass
+            return False
 
     def delete(self) -> None:
         try:
@@ -2259,12 +3013,44 @@ class OverlayApp:
         self.needs_render_after_menu = False
         self.needs_visibility_after_menu = False
         self.force_rescan = True
+        self._startup_complete = False
+        self._last_overlay_size: tuple[int, int] | None = None
+        self._last_render_signature: tuple[Any, ...] | None = None
+        self._force_render_requested = False
+        self._stable_monitor_fingerprint: tuple[tuple[Any, ...], ...] | None = None
+        self._stable_monitors: tuple[MonitorWorkArea, ...] = ()
+        self._last_good_monitors: tuple[MonitorWorkArea, ...] = ()
+        self._pending_monitor_fingerprint: tuple[tuple[Any, ...], ...] | None = None
+        self._pending_monitor_first_seen_at = 0.0
+        self._pending_monitor_last_seen_at = 0.0
+        self._pending_monitor_sample_count = 0
+        self._native_display_dirty = False
+        self._native_display_dirty_at = 0.0
+        self._display_reconcile_deferred = False
+        self._display_verification_after_id: Any = None
+        self._display_verification_due_at: float | None = None
+        self._pending_drag_position: list[int] | None = None
+        self._drag_monitors: tuple[MonitorWorkArea, ...] = ()
+        self._drag_window_size: tuple[int, int] | None = None
+        self._overlay_is_shown = False
+        self._topmost_enabled: bool | None = None
+        self._cached_should_show: bool | None = None
+        self._last_visibility_check_at = 0.0
+        self._next_log_poll_at = 0.0
+        self._next_state_write_at = 0.0
+        self._next_display_poll_at = 0.0
+        self._last_display_scan_succeeded = True
+        self._refresh_after_id: Any = None
+        self._native_display_observer_error: str | None = None
+        self._quitting = False
 
         self.root = tk.Tk()
+        self.root.withdraw()
         self.root.title(APP_NAME)
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
+        self._topmost_enabled = True
         try:
             self.root.attributes("-alpha", self.settings["opacity"])
         except tk.TclError:
@@ -2277,8 +3063,26 @@ class OverlayApp:
 
         self._bind_window_events(self.root)
         self._bind_window_events(self.container)
-        self._position_window()
-        self.refresh(force=True)
+        self._display_observer = WindowsDisplayChangeObserver(self.root)
+
+        self.refresh(force=True, schedule_next=False, apply_visibility=False)
+        startup_monitors = windows_monitor_work_areas()
+        if startup_monitors:
+            self._last_good_monitors = tuple(startup_monitors)
+            self._observe_display_sample(
+                monitor_topology_fingerprint(startup_monitors),
+                time.monotonic(),
+            )
+        self.reconcile_overlay_position(
+            "startup",
+            candidate=self.settings.get("position"),
+            persist=False,
+            monitors=startup_monitors,
+        )
+        self._startup_complete = True
+        self._last_overlay_size = self.current_window_size()
+        self.update_visibility(force=True)
+        self._schedule_refresh()
 
     def _bind_window_events(self, widget: tk.Widget) -> None:
         widget.bind("<ButtonPress-1>", self.start_drag)
@@ -2288,17 +3092,11 @@ class OverlayApp:
         widget.bind("<Button-2>", self.show_menu)
 
     def _position_window(self) -> None:
-        original_position = self.settings.get("position")
-        position = normalize_overlay_position(
-            original_position,
-            self.screen_bounds(),
-            self.current_window_size(),
+        self.reconcile_overlay_position(
+            "position",
+            candidate=self.settings.get("position"),
+            persist=True,
         )
-        x, y = position
-        self.root.geometry(f"+{x}+{y}")
-        if original_position is not None and original_position != position:
-            self.settings["position"] = position
-            self.save_settings()
 
     def screen_bounds(self) -> tuple[int, int, int, int]:
         bounds = windows_virtual_screen_bounds()
@@ -2309,43 +3107,408 @@ class OverlayApp:
     def popup_bounds(self, anchor: tuple[int, int]) -> tuple[int, int, int, int]:
         return windows_monitor_work_area(anchor) or self.screen_bounds()
 
+    def _cached_monitor_snapshot(self) -> tuple[MonitorWorkArea, ...]:
+        stable = tuple(getattr(self, "_stable_monitors", ()))
+        if stable:
+            return stable
+        return tuple(getattr(self, "_last_good_monitors", ()))
+
+    def _remember_monitor_snapshot(
+        self,
+        monitors: tuple[MonitorWorkArea, ...] | list[MonitorWorkArea],
+    ) -> tuple[MonitorWorkArea, ...]:
+        snapshot = tuple(monitors)
+        if snapshot:
+            self._last_good_monitors = snapshot
+        return snapshot
+
     def current_window_size(self) -> tuple[int, int]:
-        self.root.update_idletasks()
-        return (
-            max(DEFAULT_OVERLAY_WIDTH, int(self.root.winfo_width())),
-            max(DEFAULT_OVERLAY_HEIGHT, int(self.root.winfo_height())),
+        try:
+            self.root.update_idletasks()
+        except (AttributeError, tk.TclError):
+            pass
+        widths = [DEFAULT_OVERLAY_WIDTH]
+        heights = [DEFAULT_OVERLAY_HEIGHT]
+        for method_name, values in (
+            ("winfo_width", widths),
+            ("winfo_reqwidth", widths),
+            ("winfo_height", heights),
+            ("winfo_reqheight", heights),
+        ):
+            try:
+                values.append(int(getattr(self.root, method_name)()))
+            except (AttributeError, TypeError, ValueError, tk.TclError):
+                pass
+        return (max(widths), max(heights))
+
+    def current_window_position(self) -> list[int]:
+        try:
+            return [int(self.root.winfo_x()), int(self.root.winfo_y())]
+        except (AttributeError, TypeError, ValueError, tk.TclError):
+            saved = self.settings.get("position")
+            if (
+                isinstance(saved, list)
+                and len(saved) == 2
+                and all(isinstance(item, int) for item in saved)
+            ):
+                return [int(saved[0]), int(saved[1])]
+            return [0, 0]
+
+    def _apply_root_position(self, position: list[int], flush: bool = True) -> bool:
+        try:
+            self.root.geometry(f"{int(position[0]):+d}{int(position[1]):+d}")
+            if flush:
+                self.root.update_idletasks()
+            return True
+        except (AttributeError, TypeError, ValueError, tk.TclError):
+            return False
+
+    def reconcile_overlay_position(
+        self,
+        reason: str,
+        candidate: Any = Ellipsis,
+        persist: bool = False,
+        monitors: tuple[MonitorWorkArea, ...] | list[MonitorWorkArea] | None = None,
+    ) -> bool:
+        if self.is_dragging and reason not in ("drag_release", "startup"):
+            return False
+
+        size = self.current_window_size()
+        current = self.current_window_position()
+        requested = current if candidate is Ellipsis else candidate
+        active_monitors = (
+            tuple(monitors)
+            if monitors is not None
+            else self._cached_monitor_snapshot() or windows_monitor_work_areas()
         )
+        if active_monitors:
+            self._remember_monitor_snapshot(active_monitors)
+        fingerprint: tuple[tuple[Any, ...], ...] | None = None
+
+        if active_monitors:
+            fingerprint = monitor_topology_fingerprint(active_monitors)
+            target = normalize_overlay_position_for_monitors(requested, active_monitors, size)
+        else:
+            # A transient empty Windows enumeration must never move or persist
+            # an already-running window. Startup/reset retain the legacy bounds
+            # as a non-persisting emergency placement path.
+            if platform.system() == "Windows" and candidate is Ellipsis:
+                return False
+            target = normalize_overlay_position(requested, self.screen_bounds(), size)
+            persist = False
+
+        if target is None:
+            return False
+        moved = current != target
+        if moved and not self._apply_root_position(target):
+            return False
+
+        applied = self.current_window_position() if moved else current
+        if moved and applied != target:
+            # Withdrawn Tk windows can defer native realization. The requested
+            # geometry is retained, but persistence waits for a later check.
+            applied = target
+            verified = False
+        elif active_monitors:
+            verified = (
+                normalize_overlay_position_for_monitors(applied, active_monitors, size) == applied
+            )
+        else:
+            verified = True
+
+        topology_is_stable = (
+            fingerprint is not None
+            and fingerprint == getattr(self, "_stable_monitor_fingerprint", None)
+        )
+        saved_position = self.settings.get("position")
+        if (
+            persist
+            and topology_is_stable
+            and verified
+            and saved_position is not None
+            and saved_position != applied
+        ):
+            self.settings["position"] = list(applied)
+            self.save_settings()
+        return moved
+
+    def _consume_native_display_notifications(self, now: float) -> bool:
+        observer = getattr(self, "_display_observer", None)
+        if observer is not None and getattr(observer, "_hwnd", 0) == 0:
+            try:
+                observer.install_if_mapped()
+            except (AttributeError, tk.TclError):
+                pass
+        if observer is not None:
+            try:
+                callback_error = observer.take_callback_error()
+            except AttributeError:
+                callback_error = None
+            if callback_error is not None:
+                self._native_display_observer_error = repr(callback_error)
+        pending = observer.take_pending() if observer is not None else set()
+        if not pending:
+            return False
+        self._native_display_dirty = True
+        self._native_display_dirty_at = now
+        return True
+
+    def _reset_pending_display_sample(self) -> None:
+        self._pending_monitor_fingerprint = None
+        self._pending_monitor_first_seen_at = 0.0
+        self._pending_monitor_last_seen_at = 0.0
+        self._pending_monitor_sample_count = 0
+
+    def _observe_display_sample(
+        self,
+        fingerprint: tuple[tuple[Any, ...], ...],
+        now: float,
+    ) -> None:
+        if fingerprint != self._pending_monitor_fingerprint:
+            self._pending_monitor_fingerprint = fingerprint
+            self._pending_monitor_first_seen_at = now
+            self._pending_monitor_last_seen_at = now
+            self._pending_monitor_sample_count = 1
+            return
+        if now - self._pending_monitor_last_seen_at >= DISPLAY_TOPOLOGY_SAMPLE_SECONDS:
+            self._pending_monitor_sample_count += 1
+            self._pending_monitor_last_seen_at = now
+
+    def _close_menu_for_display_change(self) -> bool:
+        if not self.menu_active:
+            return False
+        render_pending = self.needs_render_after_menu
+        if self.menu_window is not None:
+            try:
+                self.menu_window.close()
+            except tk.TclError:
+                pass
+            self.menu_window = None
+        self.menu_anchor = None
+        self.menu_active = False
+        self.needs_render_after_menu = False
+        self.needs_visibility_after_menu = False
+        if getattr(self, "_overlay_is_shown", False):
+            self._set_topmost(True)
+        return render_pending
+
+    def _apply_stable_display_topology(
+        self,
+        monitors: tuple[MonitorWorkArea, ...],
+        fingerprint: tuple[tuple[Any, ...], ...],
+    ) -> None:
+        topology_changed = fingerprint != self._stable_monitor_fingerprint
+        render_pending = self._close_menu_for_display_change() if topology_changed else False
+        self._stable_monitor_fingerprint = fingerprint
+        self._stable_monitors = tuple(monitors)
+        self._remember_monitor_snapshot(monitors)
+        self._native_display_dirty = False
+        self._display_reconcile_deferred = False
+        self._reset_pending_display_sample()
+
+        pending_drag_position = self._pending_drag_position
+        self._pending_drag_position = None
+        self.reconcile_overlay_position(
+            "topology",
+            candidate=pending_drag_position if pending_drag_position is not None else Ellipsis,
+            persist=pending_drag_position is None,
+            monitors=monitors,
+        )
+        if pending_drag_position is not None:
+            final_position = self.current_window_position()
+            verified_position = normalize_overlay_position_for_monitors(
+                final_position,
+                monitors,
+                self.current_window_size(),
+            )
+            if verified_position == final_position and self.settings.get("position") != final_position:
+                self.settings["position"] = final_position
+                self.save_settings()
+        if topology_changed or render_pending:
+            self.request_render(force=True)
+        self._schedule_display_verification()
+
+    def _check_display_topology(
+        self,
+        now: float | None = None,
+        monitors: tuple[MonitorWorkArea, ...] | list[MonitorWorkArea] | None = None,
+    ) -> bool:
+        observed_at = time.monotonic() if now is None else now
+        self._consume_native_display_notifications(observed_at)
+        observed_monitors = (
+            windows_monitor_work_areas()
+            if monitors is None
+            else tuple(monitors)
+        )
+        self._last_display_scan_succeeded = bool(observed_monitors)
+        if not observed_monitors:
+            return False
+        self._remember_monitor_snapshot(observed_monitors)
+        fingerprint = monitor_topology_fingerprint(observed_monitors)
+        stable_fingerprint = self._stable_monitor_fingerprint
+        needs_reconcile = (
+            stable_fingerprint is None
+            or fingerprint != stable_fingerprint
+            or self._native_display_dirty
+            or self._display_reconcile_deferred
+        )
+        if not needs_reconcile:
+            self._reset_pending_display_sample()
+            return False
+
+        self._observe_display_sample(fingerprint, observed_at)
+        sample_is_stable = (
+            self._pending_monitor_sample_count >= 2
+            and observed_at - self._pending_monitor_first_seen_at
+            >= DISPLAY_TOPOLOGY_SAMPLE_SECONDS
+        )
+        native_events_are_quiet = (
+            not self._native_display_dirty
+            or observed_at - self._native_display_dirty_at
+            >= DISPLAY_TOPOLOGY_DEBOUNCE_SECONDS
+        )
+        if not sample_is_stable or not native_events_are_quiet:
+            return False
+        if self.is_dragging:
+            self._display_reconcile_deferred = True
+            return False
+
+        self._apply_stable_display_topology(tuple(observed_monitors), fingerprint)
+        return True
+
+    def _schedule_display_verification(self) -> None:
+        self._display_verification_after_id = None
+        self._display_verification_due_at = (
+            time.monotonic() + DISPLAY_TOPOLOGY_VERIFY_MS / 1_000
+        )
+
+    def _verify_display_topology(self, now: float | None = None) -> None:
+        self._display_verification_after_id = None
+        self._display_verification_due_at = None
+        observed_at = time.monotonic() if now is None else now
+        monitors = windows_monitor_work_areas()
+        self._last_display_scan_succeeded = bool(monitors)
+        if not monitors:
+            self._native_display_dirty = True
+            self._native_display_dirty_at = observed_at
+            return
+        self._remember_monitor_snapshot(monitors)
+        fingerprint = monitor_topology_fingerprint(monitors)
+        if fingerprint != self._stable_monitor_fingerprint:
+            self._observe_display_sample(fingerprint, observed_at)
+            return
+        if not self.is_dragging:
+            self.reconcile_overlay_position(
+                "topology_verification",
+                persist=True,
+                monitors=monitors,
+            )
 
     def start_drag(self, event: tk.Event) -> None:
         if self.menu_active:
             return
         self.is_dragging = True
         self.drag_offset = (event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y())
+        now = time.monotonic()
+        self._consume_native_display_notifications(now)
+        topology_pending = (
+            getattr(self, "_native_display_dirty", False)
+            or getattr(self, "_pending_monitor_fingerprint", None) is not None
+            or getattr(self, "_display_reconcile_deferred", False)
+            or getattr(self, "_stable_monitor_fingerprint", None) is None
+        )
+        if topology_pending:
+            fresh_monitors = windows_monitor_work_areas()
+            self._check_display_topology(now=now, monitors=fresh_monitors)
+            self._next_display_poll_at = self._display_followup_deadline(now)
+            monitors = fresh_monitors or self._cached_monitor_snapshot()
+        else:
+            monitors = self._cached_monitor_snapshot() or windows_monitor_work_areas()
+        self._drag_monitors = self._remember_monitor_snapshot(monitors) if monitors else ()
+        self._drag_window_size = self.current_window_size()
 
     def drag(self, event: tk.Event) -> None:
         if self.drag_offset is None or not self.is_dragging:
             return
         offset_x, offset_y = self.drag_offset
-        pointer_x = int(getattr(event, "x_root", self.root.winfo_pointerx()))
-        pointer_y = int(getattr(event, "y_root", self.root.winfo_pointery()))
-        x, y = clamp_overlay_position(
-            [pointer_x - offset_x, pointer_y - offset_y],
-            self.screen_bounds(),
-            self.current_window_size(),
-        )
-        self.root.geometry(f"+{x}+{y}")
+        try:
+            pointer_x = int(event.x_root)
+            pointer_y = int(event.y_root)
+        except (AttributeError, TypeError, ValueError):
+            pointer_x = int(self.root.winfo_pointerx())
+            pointer_y = int(self.root.winfo_pointery())
+        proposed = [pointer_x - offset_x, pointer_y - offset_y]
+        monitors = tuple(getattr(self, "_drag_monitors", ()))
+        window_size = getattr(self, "_drag_window_size", None) or self.current_window_size()
+        if monitors:
+            position = normalize_overlay_position_for_monitors(
+                proposed,
+                monitors,
+                window_size,
+            )
+        else:
+            position = clamp_overlay_position(
+                proposed,
+                self.screen_bounds(),
+                window_size,
+            )
+        if position is not None:
+            self._apply_root_position(position, flush=False)
 
     def end_drag(self, _event: tk.Event) -> None:
         if not self.is_dragging:
             return
         self.drag_offset = None
         self.is_dragging = False
-        self.settings["position"] = clamp_overlay_position(
-            [self.root.winfo_x(), self.root.winfo_y()],
-            self.screen_bounds(),
-            self.current_window_size(),
+        now = time.monotonic()
+        self._consume_native_display_notifications(now)
+        monitors = windows_monitor_work_areas()
+        self._last_display_scan_succeeded = bool(monitors)
+        topology_is_transitioning = False
+        if monitors:
+            self._remember_monitor_snapshot(monitors)
+            fingerprint = monitor_topology_fingerprint(monitors)
+            self.reconcile_overlay_position(
+                "drag_release",
+                candidate=self.current_window_position(),
+                persist=False,
+                monitors=monitors,
+            )
+            final_position = self.current_window_position()
+            topology_is_transitioning = (
+                self._display_reconcile_deferred
+                or self._native_display_dirty
+                or fingerprint != self._stable_monitor_fingerprint
+            )
+            if topology_is_transitioning:
+                self._pending_drag_position = final_position
+                self._observe_display_sample(fingerprint, now)
+            elif self.settings.get("position") != final_position:
+                self.settings["position"] = final_position
+                self.save_settings()
+        elif platform.system() != "Windows":
+            final_position = clamp_overlay_position(
+                self.current_window_position(),
+                self.screen_bounds(),
+                self.current_window_size(),
+            )
+            if self.settings.get("position") != final_position:
+                self.settings["position"] = final_position
+                self.save_settings()
+        else:
+            # Preserve the user's completed drag in memory, but wait for a
+            # valid monitor snapshot before moving or writing it to settings.
+            self._pending_drag_position = self.current_window_position()
+            self._native_display_dirty = True
+            self._native_display_dirty_at = now
+            topology_is_transitioning = True
+        self._next_display_poll_at = (
+            self._display_followup_deadline(now)
+            if topology_is_transitioning
+            else now + DISPLAY_TOPOLOGY_POLL_INTERVAL_SECONDS
         )
-        self.save_settings()
+        self._drag_monitors = ()
+        self._drag_window_size = None
         if self.needs_render_after_drag:
             self.request_render(force=True)
 
@@ -2353,21 +3516,216 @@ class OverlayApp:
         try:
             self.root.mainloop()
         finally:
+            observer = getattr(self, "_display_observer", None)
+            if observer is not None:
+                observer.close_before_root_destroy()
             self.runtime_state.delete()
 
-    def refresh(self, force: bool = False, schedule_next: bool = True) -> None:
-        self.refresh_detected_model(force=force or self.force_rescan)
-        batch = self.reader.read_updates(force_rescan=force or self.force_rescan)
-        self.force_rescan = False
+    def _schedule_refresh(self) -> None:
+        old_identifier = getattr(self, "_refresh_after_id", None)
+        if old_identifier is not None:
+            try:
+                self.root.after_cancel(old_identifier)
+            except (AttributeError, tk.TclError):
+                pass
+        if getattr(self, "_quitting", False):
+            self._refresh_after_id = None
+            return
+
+        delay_ms = (
+            POLL_INTERVAL_MS
+            if getattr(self, "_overlay_is_shown", False)
+            else HIDDEN_POLL_INTERVAL_MS
+        )
+        try:
+            self._refresh_after_id = self.root.after(delay_ms, self._scheduled_refresh)
+        except (AttributeError, tk.TclError):
+            self._refresh_after_id = None
+
+    def _scheduled_refresh(self) -> None:
+        self._refresh_after_id = None
+        self.refresh()
+
+    def _visibility_should_show(self, now: float, force: bool = False) -> bool:
+        mode = normalize_visibility_mode(self.settings.get("visibility_mode"))
+        if mode == "always":
+            self._cached_should_show = True
+            self._last_visibility_check_at = now
+            return True
+
+        cached = getattr(self, "_cached_should_show", None)
+        last_check_at = getattr(self, "_last_visibility_check_at", 0.0)
+        if mode == "process":
+            interval = PROCESS_VISIBILITY_POLL_INTERVAL_SECONDS
+        elif getattr(self, "_overlay_is_shown", False):
+            interval = POLL_INTERVAL_MS / 1_000
+        else:
+            interval = HIDDEN_POLL_INTERVAL_MS / 1_000
+
+        if force or cached is None or now - last_check_at >= interval:
+            cached = self.process_backend.should_show(mode)
+            self._cached_should_show = bool(cached)
+            self._last_visibility_check_at = now
+        return bool(cached)
+
+    def _semantic_state_signature(self) -> tuple[Any, ...]:
+        counter = self.token_counter
+        return (
+            self.snapshot,
+            self.detected_model,
+            self.counter_reset_model,
+            counter.reset_at,
+            counter.totals,
+            counter.short_context_totals,
+            counter.long_context_totals,
+            counter.long_context_request_count,
+            counter.last_update_at,
+            len(counter.seen_events),
+        )
+
+    def _refresh_data(self, force_rescan: bool, now: float) -> bool:
+        previous_signature = self._semantic_state_signature()
+        self.refresh_detected_model(force=force_rescan)
+        batch = self.reader.read_updates(force_rescan=force_rescan, now=now)
         if batch.snapshot is not None:
             self.snapshot = batch.snapshot
         self.token_counter.add_events(batch.token_events)
+        return self._semantic_state_signature() != previous_signature
 
-        self.request_render()
-        self.update_visibility()
-        self.runtime_state.write(self.snapshot, self.token_counter, self.current_api_cost_estimate())
+    def _write_runtime_state(self, now: float | None = None) -> bool:
+        observed_at = time.monotonic() if now is None else now
+        written = self.runtime_state.write(
+            self.snapshot,
+            self.token_counter,
+            self.current_api_cost_estimate(),
+        )
+        if written is not False:
+            self._next_state_write_at = (
+                observed_at + RUNTIME_STATE_WRITE_INTERVAL_SECONDS
+            )
+            return True
+        return False
+
+    def _check_display_topology_if_due(
+        self,
+        now: float,
+        force: bool = False,
+        monitors: tuple[MonitorWorkArea, ...] | list[MonitorWorkArea] | None = None,
+    ) -> bool:
+        native_notification = self._consume_native_display_notifications(now)
+        verification_due_at = getattr(self, "_display_verification_due_at", None)
+        if verification_due_at is not None and now >= verification_due_at:
+            if monitors is None and not force and not native_notification:
+                self._verify_display_topology(now=now)
+                self._next_display_poll_at = self._display_followup_deadline(now)
+                return False
+            self._display_verification_after_id = None
+            self._display_verification_due_at = None
+
+        if (
+            monitors is None
+            and not force
+            and not native_notification
+            and now < getattr(self, "_next_display_poll_at", 0.0)
+        ):
+            return False
+
+        if monitors is None:
+            changed = self._check_display_topology(now=now)
+        else:
+            changed = self._check_display_topology(now=now, monitors=monitors)
+        self._next_display_poll_at = self._display_followup_deadline(now)
+        return changed
+
+    def _display_followup_deadline(self, now: float) -> float:
+        if not getattr(self, "_last_display_scan_succeeded", True):
+            retry_seconds = (
+                DISPLAY_TOPOLOGY_RETRY_SECONDS
+                if platform.system() == "Windows"
+                else DISPLAY_TOPOLOGY_POLL_INTERVAL_SECONDS
+            )
+            return now + retry_seconds
+
+        pending_fingerprint = getattr(self, "_pending_monitor_fingerprint", None)
+        display_dirty = getattr(self, "_native_display_dirty", False)
+        reconcile_deferred = getattr(self, "_display_reconcile_deferred", False)
+        if getattr(self, "is_dragging", False) and reconcile_deferred:
+            return now + DISPLAY_TOPOLOGY_POLL_INTERVAL_SECONDS
+
+        if pending_fingerprint is not None:
+            sample_count = getattr(self, "_pending_monitor_sample_count", 0)
+            if sample_count < 2:
+                last_sample_at = getattr(self, "_pending_monitor_last_seen_at", now)
+                return max(now, last_sample_at + DISPLAY_TOPOLOGY_SAMPLE_SECONDS)
+            if display_dirty:
+                dirty_at = getattr(self, "_native_display_dirty_at", now)
+                return max(now, dirty_at + DISPLAY_TOPOLOGY_DEBOUNCE_SECONDS)
+            return now + DISPLAY_TOPOLOGY_SAMPLE_SECONDS
+
+        if (
+            display_dirty
+            or reconcile_deferred
+            or getattr(self, "_stable_monitor_fingerprint", None) is None
+        ):
+            return now + DISPLAY_TOPOLOGY_RETRY_SECONDS
+        return now + DISPLAY_TOPOLOGY_POLL_INTERVAL_SECONDS
+
+    def refresh(
+        self,
+        force: bool = False,
+        schedule_next: bool = True,
+        apply_visibility: bool = True,
+    ) -> None:
+        now = time.monotonic()
+        was_shown = getattr(self, "_overlay_is_shown", False)
+        if apply_visibility:
+            if self.menu_active and not force:
+                should_show = was_shown
+            else:
+                should_show = self._visibility_should_show(now, force=force)
+        else:
+            should_show = True
+        becoming_visible = apply_visibility and should_show and not was_shown
+        pre_show_monitors = (
+            tuple(windows_monitor_work_areas())
+            if becoming_visible
+            else None
+        )
+
+        force_rescan = bool(force or self.force_rescan)
+        log_poll_due = (
+            force_rescan
+            or becoming_visible
+            or now >= getattr(self, "_next_log_poll_at", 0.0)
+        )
+        data_changed = False
+        if log_poll_due:
+            data_changed = self._refresh_data(force_rescan=force_rescan, now=now)
+            self.force_rescan = False
+            log_interval = (
+                POLL_INTERVAL_MS / 1_000
+                if should_show
+                else HIDDEN_LOG_POLL_INTERVAL_SECONDS
+            )
+            self._next_log_poll_at = now + log_interval
+
+        if should_show:
+            self.request_render()
+        if self._startup_complete:
+            self._check_display_topology_if_due(
+                now,
+                force=force,
+                monitors=pre_show_monitors,
+            )
+        if apply_visibility:
+            self.update_visibility(
+                should_show=should_show,
+                monitors=pre_show_monitors,
+            )
+        if force or data_changed or now >= getattr(self, "_next_state_write_at", 0.0):
+            self._write_runtime_state(now)
         if schedule_next:
-            self.root.after(POLL_INTERVAL_MS, self.refresh)
+            self._schedule_refresh()
 
     def manual_refresh(self) -> None:
         self.force_rescan = True
@@ -2390,24 +3748,54 @@ class OverlayApp:
             long_context_request_count=self.token_counter.long_context_request_count,
         )
 
+    def _render_model(
+        self,
+    ) -> tuple[tuple[DisplayWidget, ...], str, tuple[Any, ...]]:
+        widgets = tuple(self.display_widgets())
+        layout_mode = self.settings.get("layout_mode", DEFAULT_LAYOUT_MODE)
+        return widgets, layout_mode, (widgets, layout_mode)
+
     def request_render(self, force: bool = False) -> None:
         if not force and self.menu_active:
-            self.needs_render_after_menu = True
+            if not hasattr(self, "_last_render_signature"):
+                self.needs_render_after_menu = True
+            else:
+                _widgets, _layout_mode, signature = self._render_model()
+                self.needs_render_after_menu = (
+                    signature != self._last_render_signature
+                )
             return
         if not force and self.is_dragging:
-            self.needs_render_after_drag = True
+            if not hasattr(self, "_last_render_signature"):
+                self.needs_render_after_drag = True
+            else:
+                _widgets, _layout_mode, signature = self._render_model()
+                self.needs_render_after_drag = (
+                    signature != self._last_render_signature
+                )
             return
         self.needs_render_after_menu = False
         self.needs_render_after_drag = False
+        if force:
+            self._force_render_requested = True
         self.render()
 
     def render(self) -> None:
+        force_render = bool(getattr(self, "_force_render_requested", False))
+        self._force_render_requested = False
+        widgets, layout_mode, render_signature = self._render_model()
+        if (
+            not force_render
+            and render_signature == getattr(self, "_last_render_signature", None)
+        ):
+            return
+
+        previous_size = self._last_overlay_size
         for label in self.labels:
             label.destroy()
         self.labels.clear()
 
-        widgets = self.display_widgets()
-        positions = layout_positions(len(widgets), self.settings.get("layout_mode", DEFAULT_LAYOUT_MODE))
+        positions = layout_positions(len(widgets), layout_mode)
         for index, widget in enumerate(widgets):
             label = tk.Label(
                 self.container,
@@ -2422,6 +3810,30 @@ class OverlayApp:
             label.grid(row=row, column=column, sticky="w", padx=2, pady=1)
             self._bind_window_events(label)
             self.labels.append(label)
+        self._last_render_signature = render_signature
+        rendered_size = self.current_window_size()
+        self._last_overlay_size = rendered_size
+        if self._startup_complete and previous_size is not None and rendered_size != previous_size:
+            topology_pending = (
+                getattr(self, "_pending_monitor_fingerprint", None) is not None
+                or getattr(self, "_native_display_dirty", False)
+                or getattr(self, "_display_reconcile_deferred", False)
+            )
+            if topology_pending:
+                self._display_reconcile_deferred = True
+                observed_at = time.monotonic()
+                self._next_display_poll_at = min(
+                    getattr(self, "_next_display_poll_at", observed_at),
+                    observed_at + DISPLAY_TOPOLOGY_SAMPLE_SECONDS,
+                )
+                return
+            monitors = self._cached_monitor_snapshot()
+            fingerprint = monitor_topology_fingerprint(monitors) if monitors else None
+            self.reconcile_overlay_position(
+                "render_size",
+                persist=fingerprint == self._stable_monitor_fingerprint,
+                monitors=monitors,
+            )
 
     def display_widgets(self) -> list[DisplayWidget]:
         widgets: list[DisplayWidget] = []
@@ -2475,18 +3887,61 @@ class OverlayApp:
             return None
         return self.snapshot.primary if key == "primary" else self.snapshot.secondary
 
-    def update_visibility(self, force: bool = False) -> None:
-        if not force and self.menu_active:
+    def _set_topmost(self, enabled: bool) -> None:
+        requested = bool(enabled)
+        if getattr(self, "_topmost_enabled", None) == requested:
+            return
+        try:
+            self.root.attributes("-topmost", requested)
+        except (AttributeError, tk.TclError):
+            return
+        self._topmost_enabled = requested
+
+    def update_visibility(
+        self,
+        force: bool = False,
+        should_show: bool | None = None,
+        monitors: tuple[MonitorWorkArea, ...] | list[MonitorWorkArea] | None = None,
+    ) -> None:
+        if self.menu_active:
             self.needs_visibility_after_menu = True
             return
         self.needs_visibility_after_menu = False
-        mode = self.settings.get("visibility_mode", "process")
-        should_show = self.process_backend.should_show(mode)
-        if should_show:
-            self.root.deiconify()
-            self.root.attributes("-topmost", True)
+        now = time.monotonic()
+        if should_show is None:
+            should_show = self._visibility_should_show(now, force=force)
         else:
-            self.root.withdraw()
+            self._cached_should_show = bool(should_show)
+
+        was_shown = getattr(self, "_overlay_is_shown", False)
+        if should_show:
+            if not was_shown:
+                observed_monitors = (
+                    windows_monitor_work_areas()
+                    if monitors is None
+                    else tuple(monitors)
+                )
+                if observed_monitors:
+                    self._remember_monitor_snapshot(observed_monitors)
+                fingerprint = (
+                    monitor_topology_fingerprint(observed_monitors)
+                    if observed_monitors
+                    else None
+                )
+                self.reconcile_overlay_position(
+                    "pre_deiconify",
+                    persist=fingerprint == getattr(self, "_stable_monitor_fingerprint", None),
+                    monitors=observed_monitors,
+                )
+                self.root.deiconify()
+                self._overlay_is_shown = True
+                self._set_topmost(True)
+            elif force:
+                self._set_topmost(True)
+        else:
+            if was_shown:
+                self.root.withdraw()
+            self._overlay_is_shown = False
 
     def show_menu(self, event: tk.Event) -> None:
         if self.is_dragging:
@@ -2501,10 +3956,7 @@ class OverlayApp:
         self.menu_active = True
         self.needs_render_after_menu = False
         self.needs_visibility_after_menu = False
-        try:
-            self.root.attributes("-topmost", False)
-        except tk.TclError:
-            pass
+        self._set_topmost(False)
 
     def finish_menu_interaction(self) -> None:
         if not self.menu_active:
@@ -2769,7 +4221,8 @@ class OverlayApp:
             return
         self.settings["visibility_mode"] = normalize_visibility_mode(mode)
         self.save_settings()
-        self.update_visibility()
+        self.update_visibility(force=True)
+        self._schedule_refresh()
 
     def set_display_window(self, key: str, enabled: bool) -> None:
         current = set(normalize_display_windows(self.settings.get("display_windows")))
@@ -2825,19 +4278,43 @@ class OverlayApp:
         self.refresh_detected_model(force=True)
         self.token_counter.reset()
         self.counter_reset_model = self.detected_model.model
-        self.runtime_state.write(self.snapshot, self.token_counter, self.current_api_cost_estimate())
+        self._write_runtime_state()
         self.request_render()
 
     def reset_position(self) -> None:
         self.settings["position"] = None
         self.save_settings()
-        self._position_window()
         self.request_render()
+        self.reconcile_overlay_position(
+            "reset",
+            candidate=None,
+            persist=False,
+        )
 
     def save_settings(self) -> None:
         save_settings(self.settings, self.settings_path)
 
     def quit(self) -> None:
+        if self._quitting:
+            return
+        self._quitting = True
+        refresh_after_id = getattr(self, "_refresh_after_id", None)
+        if refresh_after_id is not None:
+            try:
+                self.root.after_cancel(refresh_after_id)
+            except (AttributeError, tk.TclError):
+                pass
+            self._refresh_after_id = None
+        if self._display_verification_after_id is not None:
+            try:
+                self.root.after_cancel(self._display_verification_after_id)
+            except (AttributeError, tk.TclError):
+                pass
+            self._display_verification_after_id = None
+        self._display_verification_due_at = None
+        observer = getattr(self, "_display_observer", None)
+        if observer is not None:
+            observer.close_before_root_destroy()
         self.runtime_state.delete()
         self.root.destroy()
 
