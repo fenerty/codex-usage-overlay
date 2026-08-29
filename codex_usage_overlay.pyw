@@ -101,6 +101,10 @@ MENU_MIN_WRAP_LENGTH = 180
 MENU_MAX_WRAP_LENGTH = 420
 MENU_SCROLLBAR_WIDTH = 16
 MENU_RELATED_POPUP_GAP = 6
+MENU_FOCUS_ARM_DELAY_MS = 150
+MENU_FOCUS_LOSS_DEBOUNCE_MS = 100
+MENU_FOCUS_LOSS_CONFIRMATIONS = 2
+POST_MENU_VISIBILITY_DELAY_MS = 250
 
 MODEL_ASSIGNMENT_RE = re.compile(r'(?:^|[\s{,])model=(?:"([^"]+)"|([^\s},]+))', re.IGNORECASE)
 CONFIG_MODEL_RE = re.compile(r'^\s*model\s*=\s*"([^"]+)"\s*$', re.IGNORECASE | re.MULTILINE)
@@ -2752,6 +2756,7 @@ class ContextMenuWindow:
         self.window.transient(app.root)
         self.window.bind("<Escape>", self._dismiss)
         self.window.bind("<FocusOut>", self._schedule_focus_dismiss)
+        self.window.bind("<FocusIn>", self._cancel_focus_dismiss)
         self.window.bind("<Button-1>", self._dismiss_if_outside, add="+")
         self.window.bind("<Button-3>", self._dismiss_if_outside, add="+")
         try:
@@ -2769,6 +2774,9 @@ class ContextMenuWindow:
         self.frame.bind("<Configure>", self._update_scroll_region)
         self.closed = False
         self.focus_dismiss_enabled = False
+        self._focus_arm_after_id: Any = None
+        self._focus_dismiss_after_id: Any = None
+        self._focus_loss_confirmations = 0
         self.scrollable = False
         self.row_labels: list[tk.Label] = []
         self._bind_scroll_events(self.window)
@@ -2877,12 +2885,16 @@ class ContextMenuWindow:
             self.window.focus_force()
         except tk.TclError:
             pass
-        self.window.after(150, self._enable_focus_dismiss)
+        self._focus_arm_after_id = self.window.after(
+            MENU_FOCUS_ARM_DELAY_MS,
+            self._enable_focus_dismiss,
+        )
 
     def close(self) -> None:
         if self.closed:
             return
         self.closed = True
+        self._cancel_owned_callbacks()
         try:
             if self.window.grab_current() == self.window:
                 self.window.grab_release()
@@ -2941,6 +2953,9 @@ class ContextMenuWindow:
         return "break"
 
     def _enable_focus_dismiss(self) -> None:
+        self._focus_arm_after_id = None
+        if self.closed:
+            return
         self.focus_dismiss_enabled = True
 
     def _invoke(self, row: MenuRow) -> str:
@@ -2949,26 +2964,65 @@ class ContextMenuWindow:
         return "break"
 
     def _dismiss(self, _event: tk.Event | None = None) -> str:
-        self.app.finish_menu_interaction()
+        self.app.finish_menu_interaction("escape")
         return "break"
 
     def _schedule_focus_dismiss(self, _event: tk.Event | None = None) -> None:
-        if self.focus_dismiss_enabled:
-            self.window.after(50, self._dismiss_if_focus_lost)
+        if self.closed or not self.focus_dismiss_enabled:
+            return
+        self._cancel_focus_dismiss()
+        self._focus_dismiss_after_id = self.window.after(
+            MENU_FOCUS_LOSS_DEBOUNCE_MS,
+            self._dismiss_if_focus_lost,
+        )
+
+    def _cancel_focus_dismiss(self, _event: tk.Event | None = None) -> None:
+        after_id = self._focus_dismiss_after_id
+        self._focus_dismiss_after_id = None
+        self._focus_loss_confirmations = 0
+        if after_id is None:
+            return
+        try:
+            self.window.after_cancel(after_id)
+        except (AttributeError, tk.TclError):
+            pass
+
+    def _cancel_owned_callbacks(self) -> None:
+        after_ids = (self._focus_arm_after_id, self._focus_dismiss_after_id)
+        self._focus_arm_after_id = None
+        self._focus_dismiss_after_id = None
+        self._focus_loss_confirmations = 0
+        for after_id in after_ids:
+            if after_id is None:
+                continue
+            try:
+                self.window.after_cancel(after_id)
+            except (AttributeError, tk.TclError):
+                pass
 
     def _dismiss_if_focus_lost(self) -> None:
+        self._focus_dismiss_after_id = None
         if self.closed:
             return
         try:
             focused = self.window.focus_displayof()
         except tk.TclError:
             focused = None
-        if focused is None or not self._is_descendant(focused):
-            self.app.finish_menu_interaction()
+        if focused is not None and self._is_descendant(focused):
+            self._focus_loss_confirmations = 0
+            return
+        self._focus_loss_confirmations += 1
+        if self._focus_loss_confirmations < MENU_FOCUS_LOSS_CONFIRMATIONS:
+            self._focus_dismiss_after_id = self.window.after(
+                MENU_FOCUS_LOSS_DEBOUNCE_MS,
+                self._dismiss_if_focus_lost,
+            )
+            return
+        self.app.finish_menu_interaction("focus_loss")
 
     def _dismiss_if_outside(self, event: tk.Event) -> str | None:
         if not self._point_inside(int(event.x_root), int(event.y_root)):
-            self.app.finish_menu_interaction()
+            self.app.finish_menu_interaction("outside_click")
             return "break"
         return None
 
@@ -3012,6 +3066,8 @@ class OverlayApp:
         self.needs_render_after_drag = False
         self.needs_render_after_menu = False
         self.needs_visibility_after_menu = False
+        self._post_menu_visibility_after_id: Any = None
+        self._last_menu_close_reason: str | None = None
         self.force_rescan = True
         self._startup_complete = False
         self._last_overlay_size: tuple[int, int] | None = None
@@ -3088,8 +3144,8 @@ class OverlayApp:
         widget.bind("<ButtonPress-1>", self.start_drag)
         widget.bind("<B1-Motion>", self.drag)
         widget.bind("<ButtonRelease-1>", self.end_drag)
-        widget.bind("<Button-3>", self.show_menu)
-        widget.bind("<Button-2>", self.show_menu)
+        widget.bind("<ButtonRelease-3>", self.show_menu)
+        widget.bind("<ButtonRelease-2>", self.show_menu)
 
     def _position_window(self) -> None:
         self.reconcile_overlay_position(
@@ -3278,18 +3334,11 @@ class OverlayApp:
         if not self.menu_active:
             return False
         render_pending = self.needs_render_after_menu
-        if self.menu_window is not None:
-            try:
-                self.menu_window.close()
-            except tk.TclError:
-                pass
-            self.menu_window = None
-        self.menu_anchor = None
-        self.menu_active = False
-        self.needs_render_after_menu = False
-        self.needs_visibility_after_menu = False
-        if getattr(self, "_overlay_is_shown", False):
-            self._set_topmost(True)
+        self.finish_menu_interaction(
+            "display_change",
+            apply_deferred_render=False,
+            schedule_visibility=False,
+        )
         return render_pending
 
     def _apply_stable_display_topology(
@@ -3944,40 +3993,107 @@ class OverlayApp:
             self._overlay_is_shown = False
 
     def show_menu(self, event: tk.Event) -> None:
-        if self.is_dragging:
+        if self.is_dragging or getattr(self, "_quitting", False):
             return
         if self.menu_active:
-            self.finish_menu_interaction()
+            self.finish_menu_interaction(
+                "reopen",
+                apply_deferred_render=False,
+                schedule_visibility=False,
+            )
         self.begin_menu_interaction()
         self.menu_anchor = (int(event.x_root), int(event.y_root))
         self.replace_menu_window(self.build_menu_rows(), self.menu_anchor)
 
     def begin_menu_interaction(self) -> None:
+        self._cancel_post_menu_visibility_reconcile()
         self.menu_active = True
         self.needs_render_after_menu = False
         self.needs_visibility_after_menu = False
         self._set_topmost(False)
 
-    def finish_menu_interaction(self) -> None:
-        if not self.menu_active:
+    def _close_menu_window(self, reason: str) -> bool:
+        menu_window = getattr(self, "menu_window", None)
+        self.menu_window = None
+        if menu_window is None:
+            return False
+        self._last_menu_close_reason = reason
+        try:
+            menu_window.close()
+        except (AttributeError, tk.TclError):
+            pass
+        return True
+
+    def _cancel_post_menu_visibility_reconcile(self) -> None:
+        after_id = getattr(self, "_post_menu_visibility_after_id", None)
+        self._post_menu_visibility_after_id = None
+        if after_id is None:
             return
-        if self.menu_window is not None:
-            self.menu_window.close()
-            self.menu_window = None
+        try:
+            self.root.after_cancel(after_id)
+        except (AttributeError, tk.TclError):
+            pass
+
+    def _reconcile_visibility_after_menu(self) -> None:
+        self._post_menu_visibility_after_id = None
+        if getattr(self, "_quitting", False) or getattr(self, "menu_active", False):
+            return
+        self.update_visibility(force=True)
+
+    def _schedule_post_menu_visibility_reconcile(self) -> None:
+        self._cancel_post_menu_visibility_reconcile()
+        if getattr(self, "_quitting", False):
+            return
+        try:
+            self._post_menu_visibility_after_id = self.root.after(
+                POST_MENU_VISIBILITY_DELAY_MS,
+                self._reconcile_visibility_after_menu,
+            )
+        except (AttributeError, tk.TclError):
+            self._post_menu_visibility_after_id = None
+            self.update_visibility(force=True)
+
+    def finish_menu_interaction(
+        self,
+        reason: str = "dismissed",
+        *,
+        apply_deferred_render: bool = True,
+        schedule_visibility: bool = True,
+    ) -> bool:
+        had_interaction = getattr(self, "menu_active", False) or getattr(
+            self,
+            "menu_window",
+            None,
+        ) is not None
+        if not had_interaction:
+            return False
+        render_pending = getattr(self, "needs_render_after_menu", False)
+        self._close_menu_window(reason)
+        self._last_menu_close_reason = reason
         self.menu_anchor = None
         self.menu_active = False
-        if self.needs_render_after_menu:
+        self.needs_render_after_menu = False
+        self.needs_visibility_after_menu = False
+        if (
+            apply_deferred_render
+            and render_pending
+            and not getattr(self, "_quitting", False)
+        ):
             self.request_render(force=True)
-        else:
-            self.needs_render_after_menu = False
-        self.update_visibility(force=True)
+        if schedule_visibility:
+            self._schedule_post_menu_visibility_reconcile()
+        elif getattr(self, "_overlay_is_shown", False) and not getattr(
+            self,
+            "_quitting",
+            False,
+        ):
+            self._set_topmost(True)
+        return True
 
     def replace_menu_window(self, rows: list[MenuRow], anchor: tuple[int, int] | None = None) -> None:
         if anchor is None:
             anchor = self.current_menu_anchor()
-        if self.menu_window is not None:
-            self.menu_window.close()
-            self.menu_window = None
+        self._close_menu_window("replacement")
         self.menu_anchor = anchor
         self.menu_window = ContextMenuWindow(self, rows)
         self.menu_window.show(anchor[0], anchor[1])
@@ -3999,10 +4115,8 @@ class OverlayApp:
         self.replace_menu_window(self.build_menu_rows())
 
     def run_menu_command(self, action: Callable[[], None]) -> None:
-        try:
-            action()
-        finally:
-            self.finish_menu_interaction()
+        self.finish_menu_interaction("command")
+        action()
 
     def build_menu_rows(self) -> list[MenuRow]:
         rows: list[MenuRow] = []
@@ -4298,6 +4412,12 @@ class OverlayApp:
         if self._quitting:
             return
         self._quitting = True
+        self._cancel_post_menu_visibility_reconcile()
+        self.finish_menu_interaction(
+            "quit",
+            apply_deferred_render=False,
+            schedule_visibility=False,
+        )
         refresh_after_id = getattr(self, "_refresh_after_id", None)
         if refresh_after_id is not None:
             try:
