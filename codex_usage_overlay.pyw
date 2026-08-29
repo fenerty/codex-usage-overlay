@@ -10,6 +10,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes
 import atexit
+import hashlib
 import json
 import math
 import os
@@ -28,7 +29,7 @@ from typing import Any, Callable
 
 
 APP_NAME = "Codex Usage Overlay"
-APP_VERSION = "0.1.9"
+APP_VERSION = "0.1.10"
 SETTINGS_FILE_NAME = "codex_usage_overlay.settings.json"
 RUNTIME_STATE_FILE_NAME = "codex-usage-overlay-state.json"
 INSTANCE_LOCK_FILE_NAME = "codex-usage-overlay.lock"
@@ -41,6 +42,10 @@ CODEX_PROCESS_NAMES = {"codex.exe"}
 GENERIC_CODEX_PROCESS_NAMES = {"codex", "codex.exe"}
 WINDOWS_CHATGPT_PROCESS_NAME = "chatgpt.exe"
 WINDOWS_CODEX_PACKAGE_PREFIX = "openai.codex_"
+WINDOWS_CODEX_PACKAGE_BUILD_RE = re.compile(
+    r"^openai\.codex_(\d+(?:\.\d+){3})(?:_|$)",
+    re.IGNORECASE,
+)
 DEFAULT_OPACITY = 0.9
 POLL_INTERVAL_MS = 500
 HIDDEN_POLL_INTERVAL_MS = 1_000
@@ -104,7 +109,9 @@ MENU_RELATED_POPUP_GAP = 6
 MENU_FOCUS_ARM_DELAY_MS = 150
 MENU_FOCUS_LOSS_DEBOUNCE_MS = 100
 MENU_FOCUS_LOSS_CONFIRMATIONS = 2
+MENU_OUTSIDE_WATCH_INTERVAL_MS = 50
 POST_MENU_VISIBILITY_DELAY_MS = 250
+POST_DRAG_VISIBILITY_DELAY_MS = 250
 
 MODEL_ASSIGNMENT_RE = re.compile(r'(?:^|[\s{,])model=(?:"([^"]+)"|([^\s},]+))', re.IGNORECASE)
 CONFIG_MODEL_RE = re.compile(r'^\s*model\s*=\s*"([^"]+)"\s*$', re.IGNORECASE | re.MULTILINE)
@@ -903,18 +910,34 @@ class SqliteRateLimitReader:
         self._last_snapshot: RateSnapshot | None = None
         self._last_row_id: int | None = None
         self._database_identity: tuple[int, int] | None = None
-        self._database_signature: tuple[tuple[int, int] | None, ...] | None = None
+        self._database_signature: tuple[tuple[int, int, int, str] | None, ...] | None = None
         self._last_probe_at = 0.0
+        self._retry_required = False
 
     @staticmethod
-    def _path_signature(path: Path) -> tuple[int, int] | None:
+    def _path_signature(path: Path) -> tuple[int, int, int, str] | None:
         try:
             stat_result = path.stat()
         except OSError:
             return None
-        return (int(stat_result.st_size), int(stat_result.st_mtime_ns))
+        fingerprint = hashlib.blake2s(digest_size=8)
+        try:
+            with path.open("rb") as handle:
+                header = handle.read(100)
+                fingerprint.update(header[24:32])
+                if stat_result.st_size > 100:
+                    handle.seek(max(0, int(stat_result.st_size) - 32))
+                    fingerprint.update(handle.read(32))
+        except OSError:
+            fingerprint.update(b"unreadable")
+        return (
+            int(stat_result.st_size),
+            int(stat_result.st_mtime_ns),
+            int(stat_result.st_ctime_ns),
+            fingerprint.hexdigest(),
+        )
 
-    def _current_database_signature(self) -> tuple[tuple[int, int] | None, ...]:
+    def _current_database_signature(self) -> tuple[tuple[int, int, int, str] | None, ...]:
         return tuple(
             self._path_signature(Path(f"{self.path}{suffix}"))
             for suffix in ("", "-wal", "-shm")
@@ -953,6 +976,7 @@ class SqliteRateLimitReader:
             and self._last_row_id is not None
             and not signature_changed
             and not fallback_probe_due
+            and not self._retry_required
         ):
             return self._last_snapshot
 
@@ -1040,9 +1064,11 @@ class SqliteRateLimitReader:
             self._last_probe_at = (
                 time.monotonic() if now is None else now
             )
+            self._retry_required = False
             return self._last_snapshot
         except (OSError, sqlite3.Error, ValueError) as exc:
             self.last_error = str(exc)
+            self._retry_required = True
             return self._last_snapshot
         finally:
             if connection is not None:
@@ -2082,14 +2108,33 @@ def load_settings(path: Path | None = None) -> dict[str, Any]:
     return settings
 
 
-def save_settings(settings: dict[str, Any], path: Path | None = None) -> None:
+def diagnostic_error_text(exc: BaseException, limit: int = 500) -> str:
+    if isinstance(exc, OSError) and exc.strerror:
+        message = exc.strerror
+    else:
+        message = str(exc)
+    compact = " ".join(message.split()) or "unknown error"
+    return f"{type(exc).__name__}: {compact}"[:limit]
+
+
+def save_settings(settings: dict[str, Any], path: Path | None = None) -> str | None:
     target = path or settings_path()
+    temp_path = target.with_name(target.name + ".tmp")
     try:
-        with target.open("w", encoding="utf-8") as handle:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with temp_path.open("w", encoding="utf-8") as handle:
             json.dump(settings, handle, indent=2, sort_keys=True)
             handle.write("\n")
-    except OSError:
-        pass
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp_path.replace(target)
+    except (OSError, TypeError, ValueError) as exc:
+        try:
+            temp_path.unlink()
+        except (FileNotFoundError, OSError):
+            pass
+        return diagnostic_error_text(exc)
+    return None
 
 
 def percent_color(value: int | None) -> str:
@@ -2472,6 +2517,7 @@ class RuntimeStateStore:
         snapshot: RateSnapshot | None,
         counter: TokenCounter,
         api_cost_estimate: ApiCostEstimate | None = None,
+        runtime_diagnostics: dict[str, Any] | None = None,
     ) -> bool:
         now = time.time()
         state = {
@@ -2486,6 +2532,7 @@ class RuntimeStateStore:
             "last_rate_snapshot": rate_snapshot_to_dict(snapshot),
             "token_counter": counter.state_dict(),
             "api_cost_estimate": api_cost_estimate_to_dict(api_cost_estimate),
+            "runtime": dict(runtime_diagnostics or {}),
         }
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -2680,6 +2727,29 @@ def windows_path_process_name(executable_path: str | None) -> str:
     return re.split(r"[\\/]", executable_path.strip())[-1].lower()
 
 
+def windows_codex_host_build_from_path(executable_path: str | None) -> str | None:
+    if not executable_path:
+        return None
+    for part in re.split(r"[\\/]", executable_path):
+        match = WINDOWS_CODEX_PACKAGE_BUILD_RE.match(part)
+        if match:
+            return match.group(1)
+    return None
+
+
+def detect_windows_codex_host_build() -> str | None:
+    if platform.system() != "Windows":
+        return None
+    builds = {
+        build
+        for pid in windows_codex_pids()
+        if (build := windows_codex_host_build_from_path(windows_process_path(pid)))
+    }
+    if not builds:
+        return None
+    return max(builds, key=lambda value: tuple(parse_int(part) for part in value.split(".")))
+
+
 def is_codex_windows_process(process_name: str | None, executable_path: str | None = None) -> bool:
     normalized_name = (process_name or "").strip().lower()
     if normalized_name in CODEX_PROCESS_NAMES:
@@ -2715,6 +2785,20 @@ def windows_foreground_is_codex() -> bool:
     pid = ctypes.wintypes.DWORD()
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     return windows_pid_is_codex(int(pid.value))
+
+
+def windows_mouse_button_activity() -> bool:
+    """Return whether a primary mouse button is down or was pressed since polling."""
+    if platform.system() != "Windows":
+        return False
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        return any(
+            int(user32.GetAsyncKeyState(button)) & 0x8001
+            for button in (0x01, 0x02, 0x04)
+        )
+    except (AttributeError, OSError):
+        return False
 
 
 def windows_has_visible_codex_window() -> bool:
@@ -2759,6 +2843,10 @@ class ContextMenuWindow:
         self.window.bind("<FocusIn>", self._cancel_focus_dismiss)
         self.window.bind("<Button-1>", self._dismiss_if_outside, add="+")
         self.window.bind("<Button-3>", self._dismiss_if_outside, add="+")
+        self.window.bind("<Button-2>", self._dismiss_if_outside, add="+")
+        self.window.bind("<ButtonRelease-1>", self._dismiss_if_outside, add="+")
+        self.window.bind("<ButtonRelease-2>", self._dismiss_if_outside, add="+")
+        self.window.bind("<ButtonRelease-3>", self._dismiss_if_outside, add="+")
         try:
             self.window.attributes("-topmost", True)
         except tk.TclError:
@@ -2776,6 +2864,7 @@ class ContextMenuWindow:
         self.focus_dismiss_enabled = False
         self._focus_arm_after_id: Any = None
         self._focus_dismiss_after_id: Any = None
+        self._outside_watch_after_id: Any = None
         self._focus_loss_confirmations = 0
         self.scrollable = False
         self.row_labels: list[tk.Label] = []
@@ -2889,6 +2978,7 @@ class ContextMenuWindow:
             MENU_FOCUS_ARM_DELAY_MS,
             self._enable_focus_dismiss,
         )
+        self._start_outside_watch()
 
     def close(self) -> None:
         if self.closed:
@@ -2988,9 +3078,14 @@ class ContextMenuWindow:
             pass
 
     def _cancel_owned_callbacks(self) -> None:
-        after_ids = (self._focus_arm_after_id, self._focus_dismiss_after_id)
+        after_ids = (
+            getattr(self, "_focus_arm_after_id", None),
+            getattr(self, "_focus_dismiss_after_id", None),
+            getattr(self, "_outside_watch_after_id", None),
+        )
         self._focus_arm_after_id = None
         self._focus_dismiss_after_id = None
+        self._outside_watch_after_id = None
         self._focus_loss_confirmations = 0
         for after_id in after_ids:
             if after_id is None:
@@ -3026,6 +3121,38 @@ class ContextMenuWindow:
             return "break"
         return None
 
+    def _start_outside_watch(self) -> None:
+        if self.closed or platform.system() != "Windows":
+            return
+        # Drain the right-click that opened the popup before watching for the
+        # next press. This observes mouse buttons only; it never installs a
+        # system hook or records input.
+        windows_mouse_button_activity()
+        self._outside_watch_after_id = self.window.after(
+            MENU_OUTSIDE_WATCH_INTERVAL_MS,
+            self._watch_for_outside_click,
+        )
+
+    def _watch_for_outside_click(self) -> None:
+        self._outside_watch_after_id = None
+        if self.closed:
+            return
+        try:
+            pointer_x = int(self.window.winfo_pointerx())
+            pointer_y = int(self.window.winfo_pointery())
+        except (AttributeError, tk.TclError, TypeError, ValueError):
+            pointer_x = pointer_y = 0
+        if windows_mouse_button_activity() and not self._point_inside(pointer_x, pointer_y):
+            self.app.finish_menu_interaction("outside_click")
+            return
+        try:
+            self._outside_watch_after_id = self.window.after(
+                MENU_OUTSIDE_WATCH_INTERVAL_MS,
+                self._watch_for_outside_click,
+            )
+        except (AttributeError, tk.TclError):
+            self._outside_watch_after_id = None
+
     def _point_inside(self, x: int, y: int) -> bool:
         try:
             left = int(self.window.winfo_rootx())
@@ -3050,6 +3177,7 @@ class OverlayApp:
         self.settings = load_settings(self.settings_path)
         self.reader = RateLogReader()
         self.process_backend = ProcessBackend()
+        self._installed_host_build = detect_windows_codex_host_build()
         self.token_counter = TokenCounter()
         self.detected_model = detect_latest_model(self.reader.codex_home)
         self.counter_reset_model = self.detected_model.model
@@ -3067,6 +3195,7 @@ class OverlayApp:
         self.needs_render_after_menu = False
         self.needs_visibility_after_menu = False
         self._post_menu_visibility_after_id: Any = None
+        self._post_drag_visibility_after_id: Any = None
         self._last_menu_close_reason: str | None = None
         self.force_rescan = True
         self._startup_complete = False
@@ -3098,9 +3227,12 @@ class OverlayApp:
         self._last_display_scan_succeeded = True
         self._refresh_after_id: Any = None
         self._native_display_observer_error: str | None = None
+        self._last_ui_error: str | None = None
+        self._last_settings_error: str | None = None
         self._quitting = False
 
         self.root = tk.Tk()
+        self.root.report_callback_exception = self._report_tk_callback_exception
         self.root.withdraw()
         self.root.title(APP_NAME)
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
@@ -3454,8 +3586,10 @@ class OverlayApp:
             )
 
     def start_drag(self, event: tk.Event) -> None:
-        if self.menu_active:
+        if self.menu_active or getattr(self, "_quitting", False):
             return
+        self._cancel_post_menu_visibility_reconcile()
+        self._cancel_post_drag_visibility_reconcile()
         self.is_dragging = True
         self.drag_offset = (event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y())
         now = time.monotonic()
@@ -3560,6 +3694,7 @@ class OverlayApp:
         self._drag_window_size = None
         if self.needs_render_after_drag:
             self.request_render(force=True)
+        self._schedule_post_drag_visibility_reconcile()
 
     def run(self) -> None:
         try:
@@ -3630,6 +3765,9 @@ class OverlayApp:
             counter.long_context_request_count,
             counter.last_update_at,
             len(counter.seen_events),
+            getattr(self, "_last_menu_close_reason", None),
+            getattr(self, "_last_ui_error", None),
+            getattr(self, "_last_settings_error", None),
         )
 
     def _refresh_data(self, force_rescan: bool, now: float) -> bool:
@@ -3641,12 +3779,43 @@ class OverlayApp:
         self.token_counter.add_events(batch.token_events)
         return self._semantic_state_signature() != previous_signature
 
+    def _runtime_diagnostics(self) -> dict[str, Any]:
+        return {
+            "overlay_shown": bool(getattr(self, "_overlay_is_shown", False)),
+            "menu_active": bool(getattr(self, "menu_active", False)),
+            "drag_active": bool(getattr(self, "is_dragging", False)),
+            "visibility_mode": normalize_visibility_mode(
+                getattr(self, "settings", {}).get("visibility_mode")
+            ),
+            "last_menu_close_reason": getattr(self, "_last_menu_close_reason", None),
+            "last_ui_error": getattr(self, "_last_ui_error", None),
+            "last_settings_error": getattr(self, "_last_settings_error", None),
+            "installed_host_build": getattr(self, "_installed_host_build", None),
+        }
+
+    def _report_tk_callback_exception(
+        self,
+        exception_type: type[BaseException],
+        exception_value: BaseException,
+        _traceback: Any,
+    ) -> None:
+        if not isinstance(exception_value, exception_type):
+            exception_value = exception_type(str(exception_value))
+        self._last_ui_error = diagnostic_error_text(exception_value)
+        if getattr(self, "_quitting", False):
+            return
+        try:
+            self._write_runtime_state()
+        except Exception:
+            pass
+
     def _write_runtime_state(self, now: float | None = None) -> bool:
         observed_at = time.monotonic() if now is None else now
         written = self.runtime_state.write(
             self.snapshot,
             self.token_counter,
             self.current_api_cost_estimate(),
+            self._runtime_diagnostics(),
         )
         if written is not False:
             self._next_state_write_at = (
@@ -3728,7 +3897,7 @@ class OverlayApp:
         now = time.monotonic()
         was_shown = getattr(self, "_overlay_is_shown", False)
         if apply_visibility:
-            if self.menu_active and not force:
+            if self._visibility_interaction_active():
                 should_show = was_shown
             else:
                 should_show = self._visibility_should_show(now, force=force)
@@ -3952,7 +4121,7 @@ class OverlayApp:
         should_show: bool | None = None,
         monitors: tuple[MonitorWorkArea, ...] | list[MonitorWorkArea] | None = None,
     ) -> None:
-        if self.menu_active:
+        if self._visibility_interaction_active():
             self.needs_visibility_after_menu = True
             return
         self.needs_visibility_after_menu = False
@@ -4007,10 +4176,10 @@ class OverlayApp:
 
     def begin_menu_interaction(self) -> None:
         self._cancel_post_menu_visibility_reconcile()
+        self._cancel_post_drag_visibility_reconcile()
         self.menu_active = True
         self.needs_render_after_menu = False
         self.needs_visibility_after_menu = False
-        self._set_topmost(False)
 
     def _close_menu_window(self, reason: str) -> bool:
         menu_window = getattr(self, "menu_window", None)
@@ -4052,6 +4221,47 @@ class OverlayApp:
         except (AttributeError, tk.TclError):
             self._post_menu_visibility_after_id = None
             self.update_visibility(force=True)
+
+    def _cancel_post_drag_visibility_reconcile(self) -> None:
+        after_id = getattr(self, "_post_drag_visibility_after_id", None)
+        self._post_drag_visibility_after_id = None
+        if after_id is None:
+            return
+        try:
+            self.root.after_cancel(after_id)
+        except (AttributeError, tk.TclError):
+            pass
+
+    def _reconcile_visibility_after_drag(self) -> None:
+        self._post_drag_visibility_after_id = None
+        if (
+            getattr(self, "_quitting", False)
+            or getattr(self, "is_dragging", False)
+            or getattr(self, "menu_active", False)
+        ):
+            return
+        self.update_visibility(force=True)
+
+    def _schedule_post_drag_visibility_reconcile(self) -> None:
+        self._cancel_post_drag_visibility_reconcile()
+        if getattr(self, "_quitting", False):
+            return
+        try:
+            self._post_drag_visibility_after_id = self.root.after(
+                POST_DRAG_VISIBILITY_DELAY_MS,
+                self._reconcile_visibility_after_drag,
+            )
+        except (AttributeError, tk.TclError):
+            self._post_drag_visibility_after_id = None
+            self.update_visibility(force=True)
+
+    def _visibility_interaction_active(self) -> bool:
+        return bool(
+            getattr(self, "menu_active", False)
+            or getattr(self, "is_dragging", False)
+            or getattr(self, "_post_menu_visibility_after_id", None) is not None
+            or getattr(self, "_post_drag_visibility_after_id", None) is not None
+        )
 
     def finish_menu_interaction(
         self,
@@ -4216,6 +4426,22 @@ class OverlayApp:
             rows.append(MenuRow.disabled(f"Plan: {self.snapshot.plan_type}"))
         if self.snapshot:
             rows.append(MenuRow.disabled(self.source_status_text()))
+        host_build = getattr(self, "_installed_host_build", None)
+        rows.append(MenuRow.disabled(f"Desktop host: {host_build or 'not detected'}"))
+        if getattr(self, "_last_menu_close_reason", None):
+            rows.append(
+                MenuRow.disabled(
+                    f"Last menu close: {self._last_menu_close_reason}"
+                )
+            )
+        if getattr(self, "_last_ui_error", None):
+            rows.append(MenuRow.disabled(f"Last UI error: {self._last_ui_error}"))
+        if getattr(self, "_last_settings_error", None):
+            rows.append(
+                MenuRow.disabled(
+                    f"Last settings error: {self._last_settings_error}"
+                )
+            )
 
         if self.snapshot:
             rows.append(MenuRow.separator())
@@ -4406,13 +4632,20 @@ class OverlayApp:
         )
 
     def save_settings(self) -> None:
-        save_settings(self.settings, self.settings_path)
+        previous_error = getattr(self, "_last_settings_error", None)
+        self._last_settings_error = save_settings(self.settings, self.settings_path)
+        if self._last_settings_error is not None or previous_error is not None:
+            try:
+                self._write_runtime_state()
+            except (AttributeError, OSError, tk.TclError):
+                pass
 
     def quit(self) -> None:
         if self._quitting:
             return
         self._quitting = True
         self._cancel_post_menu_visibility_reconcile()
+        self._cancel_post_drag_visibility_reconcile()
         self.finish_menu_interaction(
             "quit",
             apply_deferred_render=False,
