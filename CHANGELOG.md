@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.1.10 - 2026-08-29
+
+- Open the custom context menu on right-button release and keep the overlay
+  visible for the complete menu interaction.
+- Keep the parent overlay topmost while its menu is open, handle outside clicks
+  on both press and release, and use a mouse-button-only Windows watchdog when
+  an activation click is not delivered to Tk.
+- Centralize command, Escape, outside-click, confirmed focus-loss,
+  display-change, replacement, repeated-open, and quit cleanup in an
+  idempotent menu lifecycle.
+- Confirm focus loss across two debounced checks and wait 250 ms after menu
+  closure before reconciling foreground visibility, allowing Windows to return
+  focus to the ChatGPT desktop host.
+- Treat dragging as an overlay interaction and hold foreground-mode visibility
+  through motion and a 250 ms post-release reconciliation window.
+- Cancel popup, focus, visibility, refresh, and display callbacks before menu
+  replacement or shutdown so destroyed Tk roots are never accessed.
+- Retry SQLite immediately after transient read failures even when filesystem
+  signatures collide, and add a lightweight content fingerprint to the
+  database/WAL/SHM signatures used for incremental polling.
+- Save settings through an atomic temporary-file replacement, preserve the
+  previous file on failure, and expose sanitized save errors instead of
+  silently discarding them.
+- Add local runtime diagnostics for overlay/menu/drag state, the last menu closure,
+  UI and settings errors, visibility mode, and the detected packaged desktop
+  host build.
+- Preserve existing settings, CLI behavior, privacy boundaries, and standard
+  library-only packaging.
+
 ## 0.1.9 - 2026-07-17
 
 - Recover the overlay into an active monitor work area after live

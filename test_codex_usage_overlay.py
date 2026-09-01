@@ -744,22 +744,29 @@ class IncrementalSqliteReaderTests(unittest.TestCase):
             create_logs_db(path, [self.row(1_000, 20)])
             reader = overlay.SqliteRateLimitReader(path)
             original = reader.latest_snapshot(force_rescan=True, now=0)
+            stale_signature = reader._database_signature
             append_logs_db(path, [self.row(1_001, 35)])
             checkpoint = reader._last_row_id
 
             with mock.patch.object(
-                overlay.sqlite3,
-                "connect",
-                side_effect=sqlite3.OperationalError("busy"),
+                reader,
+                "_current_database_signature",
+                return_value=stale_signature,
             ):
-                failed = reader.latest_snapshot(now=0.5)
-
-            recovered = reader.latest_snapshot(now=1.0)
+                with mock.patch.object(
+                    overlay.sqlite3,
+                    "connect",
+                    side_effect=sqlite3.OperationalError("busy"),
+                ):
+                    failed = reader.latest_snapshot(force_rescan=True, now=0.5)
+                self.assertTrue(reader._retry_required)
+                recovered = reader.latest_snapshot(now=1.0)
 
             self.assertEqual(failed, original)
             self.assertEqual(checkpoint, 1)
             self.assertEqual(recovered.primary.remaining_percent, 65)
             self.assertEqual(reader._last_row_id, 2)
+            self.assertFalse(reader._retry_required)
 
     def test_fallback_probe_detects_update_when_file_signature_is_stale(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1458,7 +1465,16 @@ class RuntimeStateTests(unittest.TestCase):
                 source_observed_at=1780420843,
             )
 
-            self.assertTrue(store.write(snapshot, counter, estimate))
+            diagnostics = {
+                "overlay_shown": True,
+                "menu_active": False,
+                "visibility_mode": "foreground",
+                "last_menu_close_reason": "escape",
+                "last_ui_error": None,
+                "last_settings_error": None,
+                "installed_host_build": "26.825.4187.0",
+            }
+            self.assertTrue(store.write(snapshot, counter, estimate, diagnostics))
             state = json.loads(path.read_text(encoding="utf-8"))
 
             self.assertEqual(state["app"], overlay.APP_NAME)
@@ -1492,6 +1508,7 @@ class RuntimeStateTests(unittest.TestCase):
             self.assertEqual(state["source_observed_at"], 1780420843)
             self.assertIn("source_age_seconds", state)
             self.assertEqual(state["last_rate_snapshot"]["source_kind"], "logs_2.sqlite")
+            self.assertEqual(state["runtime"], diagnostics)
 
     def test_ignores_stale_pid_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1525,6 +1542,76 @@ class RuntimeStateTests(unittest.TestCase):
             self.assertFalse(
                 store.write(None, overlay.TokenCounter(reset_at=1_000))
             )
+
+
+class SettingsPersistenceTests(unittest.TestCase):
+    def test_settings_write_is_atomic(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "settings.json"
+            path.write_text('{"old": true}\n', encoding="utf-8")
+
+            error = overlay.save_settings({"new": True}, path)
+
+            self.assertIsNone(error)
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8")),
+                {"new": True},
+            )
+            self.assertFalse(path.with_name(path.name + ".tmp").exists())
+
+    def test_atomic_replace_failure_preserves_previous_settings_and_reports_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "settings.json"
+            original = '{"keep": true}\n'
+            path.write_text(original, encoding="utf-8")
+
+            with mock.patch.object(
+                Path,
+                "replace",
+                side_effect=PermissionError(13, "Access is denied"),
+            ):
+                error = overlay.save_settings({"new": True}, path)
+
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+            self.assertEqual(error, "PermissionError: Access is denied")
+            self.assertNotIn(temp_dir, error)
+            self.assertFalse(path.with_name(path.name + ".tmp").exists())
+
+    def test_overlay_records_settings_failure_and_refreshes_runtime_diagnostics(self):
+        app = object.__new__(overlay.OverlayApp)
+        app.settings = {"visibility_mode": "foreground"}
+        app.settings_path = Path("settings.json")
+        app._last_settings_error = None
+        app._write_runtime_state = mock.Mock()
+
+        with mock.patch.object(
+            overlay,
+            "save_settings",
+            return_value="PermissionError: Access is denied",
+        ):
+            overlay.OverlayApp.save_settings(app)
+
+        self.assertEqual(
+            app._last_settings_error,
+            "PermissionError: Access is denied",
+        )
+        app._write_runtime_state.assert_called_once_with()
+
+    def test_tk_callback_error_is_sanitized_and_written_to_runtime_state(self):
+        app = object.__new__(overlay.OverlayApp)
+        app._quitting = False
+        app._last_ui_error = None
+        app._write_runtime_state = mock.Mock()
+
+        overlay.OverlayApp._report_tk_callback_exception(
+            app,
+            ValueError,
+            ValueError("bad\ncallback"),
+            None,
+        )
+
+        self.assertEqual(app._last_ui_error, "ValueError: bad callback")
+        app._write_runtime_state.assert_called_once_with()
 
 
 class ProcessIdentityTests(unittest.TestCase):
@@ -1561,6 +1648,47 @@ class ProcessIdentityTests(unittest.TestCase):
                     overlay.is_codex_windows_process(process_name, executable_path),
                     expected,
                 )
+
+    def test_extracts_packaged_chatgpt_host_build_without_retaining_path(self):
+        packaged_path = (
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_26.825.4187.0_x64__example"
+            r"\ChatGPT.exe"
+        )
+
+        self.assertEqual(
+            overlay.windows_codex_host_build_from_path(packaged_path),
+            "26.825.4187.0",
+        )
+        self.assertIsNone(
+            overlay.windows_codex_host_build_from_path(
+                r"C:\Program Files\WindowsApps\OpenAI.ChatGPT_2.0_x64__example\ChatGPT.exe"
+            )
+        )
+
+    def test_detects_newest_running_packaged_host_build(self):
+        process_paths = {
+            11: (
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_26.825.4187.0_x64__example"
+                r"\ChatGPT.exe"
+            ),
+            12: (
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_26.825.5331.0_x64__example"
+                r"\ChatGPT.exe"
+            ),
+        }
+
+        with mock.patch.object(overlay.platform, "system", return_value="Windows"), mock.patch.object(
+            overlay,
+            "windows_codex_pids",
+            return_value=set(process_paths),
+        ), mock.patch.object(
+            overlay,
+            "windows_process_path",
+            side_effect=lambda pid: process_paths[pid],
+        ):
+            build = overlay.detect_windows_codex_host_build()
+
+        self.assertEqual(build, "26.825.5331.0")
 
     def test_packaged_chatgpt_pid_fails_closed_when_path_is_unavailable(self):
         original_process_path = overlay.windows_process_path
@@ -2045,6 +2173,7 @@ class DisplayTopologyLifecycleTests(unittest.TestCase):
             app._next_display_poll_at,
             20.0 + overlay.DISPLAY_TOPOLOGY_POLL_INTERVAL_SECONDS,
         )
+        self.assertIsNotNone(app._post_drag_visibility_after_id)
 
     def make_app(
         self,
@@ -2072,6 +2201,8 @@ class DisplayTopologyLifecycleTests(unittest.TestCase):
         app.needs_render_after_drag = False
         app.needs_render_after_menu = False
         app.needs_visibility_after_menu = False
+        app._post_menu_visibility_after_id = None
+        app._post_drag_visibility_after_id = None
         app._stable_monitor_fingerprint = (
             overlay.monitor_topology_fingerprint(stable_monitors)
             if stable_monitors is not None
@@ -2324,6 +2455,7 @@ class DisplayTopologyLifecycleTests(unittest.TestCase):
         self.assertEqual(menu_window.close_calls, 1)
         self.assertFalse(app.menu_active)
         self.assertIsNone(app.menu_window)
+        self.assertEqual(app._last_menu_close_reason, "display_change")
         self.assertEqual(app.root.position, [1730, 940])
 
 
@@ -2473,8 +2605,8 @@ class FakeRuntimeStateStore:
         self.calls = []
         self.deleted = False
 
-    def write(self, snapshot, counter, estimate):
-        self.calls.append((snapshot, counter.state_dict(), estimate))
+    def write(self, snapshot, counter, estimate, diagnostics=None):
+        self.calls.append((snapshot, counter.state_dict(), estimate, diagnostics))
         return True
 
     def delete(self):
@@ -2496,10 +2628,15 @@ class AdaptiveRefreshLoopTests(unittest.TestCase):
         app.snapshot = None
         app.force_rescan = False
         app.menu_active = False
+        app.menu_window = None
+        app.menu_anchor = None
         app.is_dragging = False
         app.needs_render_after_menu = False
         app.needs_render_after_drag = False
         app.needs_visibility_after_menu = False
+        app._post_menu_visibility_after_id = None
+        app._post_drag_visibility_after_id = None
+        app._last_menu_close_reason = None
         app._overlay_is_shown = shown
         app._cached_should_show = None
         app._last_visibility_check_at = 0.0
@@ -2579,6 +2716,18 @@ class AdaptiveRefreshLoopTests(unittest.TestCase):
             app.refresh(schedule_next=False)
 
         self.assertEqual(app.process_backend.calls, [])
+
+    def test_foreground_visibility_is_held_while_dragging(self):
+        app = self.make_app(shown=True, should_show=False)
+        app.settings["visibility_mode"] = "foreground"
+        app.is_dragging = True
+
+        with mock.patch.object(overlay.time, "monotonic", return_value=100.0):
+            app.refresh(schedule_next=False)
+
+        self.assertEqual(app.process_backend.calls, [])
+        self.assertEqual(app.root.withdraw_calls, 0)
+        self.assertTrue(app._overlay_is_shown)
 
     def test_hidden_to_visible_transition_catches_up_before_showing(self):
         app = self.make_app(shown=False, should_show=False)
@@ -2787,6 +2936,32 @@ class AdaptiveRefreshLoopTests(unittest.TestCase):
         self.assertTrue(app.runtime_state.deleted)
         self.assertTrue(app.root.destroyed)
 
+    def test_quit_closes_menu_and_cancels_interaction_callbacks_before_destroy(self):
+        class FakeMenuWindow:
+            def __init__(self):
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+
+        app = self.make_app()
+        app.menu_active = True
+        menu_window = FakeMenuWindow()
+        app.menu_window = menu_window
+        app._post_menu_visibility_after_id = app.root.after(250, lambda: None)
+        menu_callback_id = app._post_menu_visibility_after_id
+        app._post_drag_visibility_after_id = app.root.after(250, lambda: None)
+        drag_callback_id = app._post_drag_visibility_after_id
+
+        app.quit()
+
+        self.assertEqual(menu_window.close_calls, 1)
+        self.assertEqual(app._last_menu_close_reason, "quit")
+        self.assertIn(menu_callback_id, app.root.after_cancel_calls)
+        self.assertIn(drag_callback_id, app.root.after_cancel_calls)
+        self.assertEqual(app.root.after_callbacks, {})
+        self.assertTrue(app.root.destroyed)
+
 
 class RenderAndVisibilityGatingTests(unittest.TestCase):
     class FakeLabel:
@@ -2882,18 +3057,44 @@ class RenderAndVisibilityGatingTests(unittest.TestCase):
 class MenuInteractionTests(unittest.TestCase):
     def make_app(self):
         app = object.__new__(overlay.OverlayApp)
-        app.root = FakeRoot()
+        app.root = FakeSchedulerRoot()
         app.settings = {"visibility_mode": "always"}
         app.process_backend = FakeProcessBackend()
         app.menu_active = True
         app.menu_window = None
+        app.menu_anchor = (100, 100)
         app.is_dragging = False
         app.needs_render_after_menu = False
         app.needs_render_after_drag = False
         app.needs_visibility_after_menu = False
+        app._post_menu_visibility_after_id = None
+        app._post_drag_visibility_after_id = None
+        app._last_menu_close_reason = None
+        app._overlay_is_shown = True
+        app._quitting = False
+        app._cached_should_show = True
+        app._last_visibility_check_at = 0.0
         app.render_calls = 0
         app.render = lambda: setattr(app, "render_calls", app.render_calls + 1)
         return app
+
+    def test_context_menu_binds_to_button_release(self):
+        class FakeBindingWidget:
+            def __init__(self):
+                self.bindings = {}
+
+            def bind(self, event_name, callback):
+                self.bindings[event_name] = callback
+
+        app = self.make_app()
+        widget = FakeBindingWidget()
+
+        overlay.OverlayApp._bind_window_events(app, widget)
+
+        self.assertIn("<ButtonRelease-3>", widget.bindings)
+        self.assertIn("<ButtonRelease-2>", widget.bindings)
+        self.assertNotIn("<Button-3>", widget.bindings)
+        self.assertNotIn("<Button-2>", widget.bindings)
 
     def test_render_defers_while_menu_active(self):
         app = self.make_app()
@@ -2911,6 +3112,16 @@ class MenuInteractionTests(unittest.TestCase):
         self.assertTrue(app.needs_visibility_after_menu)
         self.assertEqual(app.root.attribute_calls, [])
 
+    def test_begin_menu_interaction_keeps_visible_parent_topmost(self):
+        app = self.make_app()
+        app.menu_active = False
+
+        overlay.OverlayApp.begin_menu_interaction(app)
+
+        self.assertTrue(app.menu_active)
+        self.assertTrue(app._overlay_is_shown)
+        self.assertNotIn(("-topmost", False), app.root.attribute_calls)
+
     def test_menu_command_finishes_deferred_render_and_topmost(self):
         app = self.make_app()
 
@@ -2919,8 +3130,323 @@ class MenuInteractionTests(unittest.TestCase):
         self.assertFalse(app.menu_active)
         self.assertFalse(app.needs_render_after_menu)
         self.assertEqual(app.render_calls, 1)
-        self.assertTrue(app.root.deiconified)
+        self.assertEqual(app._last_menu_close_reason, "command")
+        self.assertEqual(app.root.after_delays[-1], overlay.POST_MENU_VISIBILITY_DELAY_MS)
+        self.assertNotIn(("-topmost", True), app.root.attribute_calls)
+
+        app.root.run_after(app._post_menu_visibility_after_id)
+
+        self.assertTrue(app._overlay_is_shown)
         self.assertIn(("-topmost", True), app.root.attribute_calls)
+
+    def test_foreground_visibility_is_leased_until_delayed_reconcile(self):
+        app = self.make_app()
+        app.settings["visibility_mode"] = "foreground"
+        app.process_backend = FakeProcessBackend(False)
+
+        overlay.OverlayApp.update_visibility(app)
+        self.assertEqual(app.root.withdraw_calls, 0)
+
+        overlay.OverlayApp.finish_menu_interaction(app, "escape")
+        self.assertEqual(app.root.withdraw_calls, 0)
+
+        app.root.run_after(app._post_menu_visibility_after_id)
+
+        self.assertEqual(app.root.withdraw_calls, 1)
+        self.assertFalse(app._overlay_is_shown)
+
+    def test_forced_visibility_update_from_menu_command_respects_lease(self):
+        app = self.make_app()
+        app.settings["visibility_mode"] = "foreground"
+        app.process_backend = FakeProcessBackend(False)
+
+        overlay.OverlayApp.run_menu_command(
+            app,
+            lambda: overlay.OverlayApp.update_visibility(app, force=True),
+        )
+
+        self.assertEqual(app.root.withdraw_calls, 0)
+        self.assertTrue(app.needs_visibility_after_menu)
+
+        app.root.run_after(app._post_menu_visibility_after_id)
+
+        self.assertEqual(app.root.withdraw_calls, 1)
+        self.assertFalse(app._overlay_is_shown)
+
+    def test_foreground_visibility_is_leased_through_drag_release(self):
+        app = self.make_app()
+        app.menu_active = False
+        app.settings["visibility_mode"] = "foreground"
+        app.process_backend = FakeProcessBackend(False)
+        app.is_dragging = True
+
+        overlay.OverlayApp.update_visibility(app, force=True)
+        self.assertEqual(app.root.withdraw_calls, 0)
+
+        app.is_dragging = False
+        overlay.OverlayApp._schedule_post_drag_visibility_reconcile(app)
+        overlay.OverlayApp.update_visibility(app, force=True)
+
+        self.assertEqual(app.root.withdraw_calls, 0)
+        self.assertEqual(
+            app.root.after_delays[-1],
+            overlay.POST_DRAG_VISIBILITY_DELAY_MS,
+        )
+
+        app.root.run_after(app._post_drag_visibility_after_id)
+
+        self.assertEqual(app.root.withdraw_calls, 1)
+        self.assertFalse(app._overlay_is_shown)
+
+    def test_finish_is_idempotent_and_cancels_replaced_reconcile(self):
+        class FakeMenuWindow:
+            def __init__(self):
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+
+        app = self.make_app()
+        menu_window = FakeMenuWindow()
+        app.menu_window = menu_window
+
+        self.assertTrue(overlay.OverlayApp.finish_menu_interaction(app, "outside_click"))
+        first_after_id = app._post_menu_visibility_after_id
+        self.assertFalse(overlay.OverlayApp.finish_menu_interaction(app, "focus_loss"))
+
+        self.assertEqual(menu_window.close_calls, 1)
+        self.assertEqual(app._last_menu_close_reason, "outside_click")
+        self.assertIn(first_after_id, app.root.after_callbacks)
+
+        overlay.OverlayApp.begin_menu_interaction(app)
+
+        self.assertIn(first_after_id, app.root.after_cancel_calls)
+        self.assertNotIn(first_after_id, app.root.after_callbacks)
+        self.assertTrue(app.menu_active)
+
+    def test_popup_focus_churn_requires_two_confirmations(self):
+        class FakePopupWindow(FakeSchedulerRoot):
+            def focus_displayof(self):
+                return None
+
+        reasons = []
+        menu = object.__new__(overlay.ContextMenuWindow)
+        menu.app = type(
+            "App",
+            (),
+            {"finish_menu_interaction": lambda _self, reason: reasons.append(reason)},
+        )()
+        menu.window = FakePopupWindow()
+        menu.closed = False
+        menu.focus_dismiss_enabled = True
+        menu._focus_arm_after_id = None
+        menu._focus_dismiss_after_id = None
+        menu._focus_loss_confirmations = 0
+
+        overlay.ContextMenuWindow._schedule_focus_dismiss(menu)
+        first_check = menu._focus_dismiss_after_id
+        menu.window.run_after(first_check)
+        transient_second_check = menu._focus_dismiss_after_id
+
+        self.assertEqual(reasons, [])
+        overlay.ContextMenuWindow._cancel_focus_dismiss(menu)
+        self.assertIn(transient_second_check, menu.window.after_cancel_calls)
+
+        overlay.ContextMenuWindow._schedule_focus_dismiss(menu)
+        menu.window.run_after(menu._focus_dismiss_after_id)
+        menu.window.run_after(menu._focus_dismiss_after_id)
+
+        self.assertEqual(reasons, ["focus_loss"])
+
+    def test_popup_close_cancels_callbacks_before_destroy(self):
+        class FakePopupWindow(FakeSchedulerRoot):
+            def __init__(self):
+                super().__init__()
+                self.grab_released = False
+
+            def grab_current(self):
+                return self
+
+            def grab_release(self):
+                self.grab_released = True
+
+        menu = object.__new__(overlay.ContextMenuWindow)
+        menu.window = FakePopupWindow()
+        menu.closed = False
+        menu._focus_loss_confirmations = 1
+        menu._focus_arm_after_id = menu.window.after(150, lambda: None)
+        menu._focus_dismiss_after_id = menu.window.after(100, lambda: None)
+        menu._outside_watch_after_id = menu.window.after(50, lambda: None)
+        owned_ids = {
+            menu._focus_arm_after_id,
+            menu._focus_dismiss_after_id,
+            menu._outside_watch_after_id,
+        }
+
+        overlay.ContextMenuWindow.close(menu)
+
+        self.assertTrue(menu.closed)
+        self.assertEqual(set(menu.window.after_cancel_calls), owned_ids)
+        self.assertEqual(menu.window.after_callbacks, {})
+        self.assertTrue(menu.window.grab_released)
+        self.assertTrue(menu.window.destroyed)
+
+    def test_windows_mouse_watch_closes_popup_after_missed_outside_click(self):
+        class FakePopupWindow(FakeSchedulerRoot):
+            def winfo_pointerx(self):
+                return 10
+
+            def winfo_pointery(self):
+                return 20
+
+        reasons = []
+        menu = object.__new__(overlay.ContextMenuWindow)
+        menu.app = type(
+            "App",
+            (),
+            {"finish_menu_interaction": lambda _self, reason: reasons.append(reason)},
+        )()
+        menu.window = FakePopupWindow()
+        menu.closed = False
+        menu._outside_watch_after_id = None
+        menu._point_inside = lambda _x, _y: False
+
+        with mock.patch.object(overlay, "windows_mouse_button_activity", return_value=True):
+            overlay.ContextMenuWindow._watch_for_outside_click(menu)
+
+        self.assertEqual(reasons, ["outside_click"])
+        self.assertIsNone(menu._outside_watch_after_id)
+        self.assertEqual(menu.window.after_callbacks, {})
+
+    def test_menu_replacement_closes_only_the_popup(self):
+        class FakeMenuWindow:
+            instances = []
+
+            def __init__(self, _app=None, rows=None):
+                self.rows = rows
+                self.close_calls = 0
+                self.show_calls = []
+                self.__class__.instances.append(self)
+
+            def close(self):
+                self.close_calls += 1
+
+            def show(self, x, y):
+                self.show_calls.append((x, y))
+
+        app = self.make_app()
+        old_window = FakeMenuWindow()
+        app.menu_window = old_window
+
+        with mock.patch.object(overlay, "ContextMenuWindow", FakeMenuWindow):
+            overlay.OverlayApp.replace_menu_window(
+                app,
+                [overlay.MenuRow.disabled("Details")],
+                (25, 35),
+            )
+
+        self.assertEqual(old_window.close_calls, 1)
+        self.assertTrue(app.menu_active)
+        self.assertEqual(app._last_menu_close_reason, "replacement")
+        self.assertEqual(app.menu_window.show_calls, [(25, 35)])
+
+    def test_repeated_right_click_closes_previous_interaction_before_reopening(self):
+        class FakeMenuWindow:
+            def __init__(self):
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+
+        app = self.make_app()
+        old_window = FakeMenuWindow()
+        app.menu_window = old_window
+        replacements = []
+        app.build_menu_rows = lambda: []
+        app.replace_menu_window = lambda rows, anchor: replacements.append((rows, anchor))
+        event = type("Event", (), {"x_root": 400, "y_root": 500})()
+
+        overlay.OverlayApp.show_menu(app, event)
+
+        self.assertEqual(old_window.close_calls, 1)
+        self.assertEqual(app._last_menu_close_reason, "reopen")
+        self.assertTrue(app.menu_active)
+        self.assertEqual(replacements, [([], (400, 500))])
+
+    def test_escape_and_outside_click_report_distinct_close_reasons(self):
+        reasons = []
+        menu = object.__new__(overlay.ContextMenuWindow)
+        menu.app = type(
+            "App",
+            (),
+            {"finish_menu_interaction": lambda _self, reason: reasons.append(reason)},
+        )()
+        menu._point_inside = lambda _x, _y: False
+        event = type("Event", (), {"x_root": 10, "y_root": 20})()
+
+        self.assertEqual(overlay.ContextMenuWindow._dismiss(menu), "break")
+        self.assertEqual(
+            overlay.ContextMenuWindow._dismiss_if_outside(menu, event),
+            "break",
+        )
+
+        self.assertEqual(reasons, ["escape", "outside_click"])
+
+
+@unittest.skipUnless(overlay.platform.system() == "Windows", "real Tk popup smoke is Windows-only")
+class RealTkPopupSmokeTests(unittest.TestCase):
+    def test_real_tk_popup_survives_25_bottom_edge_open_close_cycles(self):
+        try:
+            root = overlay.tk.Tk()
+        except overlay.tk.TclError as exc:
+            self.skipTest(f"Tk runtime unavailable: {exc}")
+        root.overrideredirect(True)
+        root.geometry("1x1+0+0")
+        root.deiconify()
+        try:
+            root.update_idletasks()
+            root.update()
+            bounds = (
+                0,
+                0,
+                int(root.winfo_screenwidth()),
+                int(root.winfo_screenheight()),
+            )
+            app = type(
+                "RealPopupApp",
+                (),
+                {
+                    "root": root,
+                    "popup_bounds": lambda _self, _anchor: bounds,
+                    "finish_menu_interaction": lambda _self, _reason: None,
+                },
+            )()
+            anchor = (bounds[2] - 1, bounds[3] - 1)
+
+            for _index in range(25):
+                popup = overlay.ContextMenuWindow(
+                    app,
+                    [overlay.MenuRow.disabled("Compatibility smoke")],
+                )
+                popup.show(*anchor)
+                root.update_idletasks()
+                root.update()
+                left = int(popup.window.winfo_rootx())
+                top = int(popup.window.winfo_rooty())
+                right = left + int(popup.window.winfo_width())
+                bottom = top + int(popup.window.winfo_height())
+
+                self.assertTrue(popup.window.winfo_exists())
+                self.assertGreaterEqual(left, bounds[0] + overlay.MENU_SCREEN_PADDING)
+                self.assertGreaterEqual(top, bounds[1] + overlay.MENU_SCREEN_PADDING)
+                self.assertLessEqual(right, bounds[2] - overlay.MENU_SCREEN_PADDING)
+                self.assertLessEqual(bottom, bounds[3] - overlay.MENU_SCREEN_PADDING)
+
+                popup.close()
+                root.update_idletasks()
+                root.update()
+        finally:
+            root.destroy()
 
 
 class MenuRowTests(unittest.TestCase):

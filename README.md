@@ -106,7 +106,7 @@ Supported settings include:
 
 ## Performance And Polling
 
-Version `0.1.9` keeps the existing 500 ms refresh cadence while the overlay is
+Version `0.1.10` keeps the existing 500 ms refresh cadence while the overlay is
 shown. When a visibility mode withdraws it, the app checks whether it should
 wake every 1 second and ingests new log data every 5 seconds. It performs an
 immediate log catch-up before showing the overlay again.
@@ -116,12 +116,14 @@ polling, and the runtime-state heartbeat is written every 2 seconds. These
 changes add no dependencies and do not change the UI, settings, data sources,
 or displayed calculations.
 
-Database, WAL, and shared-memory signatures wake the SQLite reader, with a
-5-second maximum-ID probe as a race-safe fallback. The newest ten session files
-and their active date directories are checked incrementally, with a full
-recursive discovery every 30 seconds. Unchanged labels and visibility state are
-reused, and monitor topology is normally enumerated only after native display
-notifications or during a 5-second fallback check.
+Database, WAL, and shared-memory metadata plus a small binary fingerprint wake
+the SQLite reader, with a 5-second maximum-ID probe as a race-safe fallback.
+Transient SQLite errors force a retry on the next poll even if signatures
+collide. The newest ten session files and their active date directories are
+checked incrementally, with a full recursive discovery every 30 seconds.
+Unchanged labels and visibility state are reused, and monitor topology is
+normally enumerated only after native display notifications or during a
+5-second fallback check.
 
 ## Privacy And Data
 
@@ -133,7 +135,9 @@ The overlay reads local files only:
 
 It does not call OpenAI APIs, upload data, read `auth.json`, or require an API
 key. The runtime state file is written to the user temp directory and deleted on
-normal quit.
+normal quit. Its additive diagnostics contain only overlay/menu/drag state, sanitized
+error text, visibility mode, and the detected packaged desktop build; executable
+paths and raw transcript content are not written.
 
 ## Limitations
 
@@ -176,11 +180,21 @@ host. Other ChatGPT installations are intentionally ignored.
 
 ### Dragging or right-click menu feels unreliable
 
-Update to `0.1.5` or newer, then check for old processes and restart the app.
-The right-click menu is a custom owned Tk window rather than a native Tk popup,
-which avoids first clicks falling through to Codex behind the overlay. The
-overlay also prevents duplicate instances so overlapping windows do not fight
-for clicks.
+Update to `0.1.10` or newer, then check for old processes and restart the app.
+Version `0.1.10` opens the custom owned Tk menu on right-button release and keeps
+the topmost overlay visible while a menu or drag interaction owns focus. It
+confirms menu focus loss before dismissal, watches mouse buttons without logging
+input so Windows activation clicks outside the popup cannot be missed, and waits
+250 ms after menu closure or drag release before re-evaluating foreground
+visibility. The Details submenu reports the last closure reason, detected desktop
+host build, and any sanitized UI or settings-save error. The overlay also prevents
+duplicate instances so overlapping windows do not fight for clicks.
+
+The Codex-capable desktop host is updated separately from this utility. Review
+the [ChatGPT & Codex changelog](https://learn.chatgpt.com/docs/changelog) when a
+host update changes behavior. After installing a desktop update, fully quit and
+reopen ChatGPT as described in OpenAI's
+[app update guidance](https://learn.chatgpt.com/docs/enterprise/manage-app-updates).
 
 ```powershell
 Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*codex_usage_overlay.pyw*' }
