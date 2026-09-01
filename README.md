@@ -13,9 +13,9 @@ This is an independent utility and is not an official OpenAI or Codex project.
 ## Features
 
 - Always-on-top, draggable, translucent Tkinter overlay.
-- Shows whichever Codex rate-limit windows are present in local telemetry. Current
-  one-window telemetry renders one widget; legacy 5-hour plus weekly telemetry
-  still renders both windows.
+- Shows whichever Codex rate-limit windows are present in local telemetry. One
+  effective window renders as a compact percentage such as `33%`; legacy 5-hour
+  plus weekly telemetry still renders both windows with their labels.
 - Uses the freshest local source available: `logs_2.sqlite` rate-limit websocket
   events first, session JSONL rate events as fallback.
 - Optional reset countdowns in the overlay.
@@ -95,7 +95,8 @@ Supported settings include:
 - `visibility_mode`: `always`, `process`, `foreground`, or `visible_window`
 - `display_windows`: `primary`, `secondary`, or both. Only slots present in the
   latest telemetry are offered or rendered; a stale missing-slot selection falls
-  back to the available window.
+  back to the available window. A single effective selection omits its window
+  label when a remaining percentage is available.
 - `layout_mode`: `horizontal` or `vertical`. Legacy `grid_2x2` values migrate to
   `horizontal` the next time settings are saved.
 - `position`: saved overlay coordinates

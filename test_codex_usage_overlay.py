@@ -3749,7 +3749,7 @@ class DisplayWidgetTests(unittest.TestCase):
             rate_limit_reached_type=None,
         )
 
-    def test_current_single_weekly_window_never_renders_duplicate_placeholder(self):
+    def test_current_single_weekly_window_uses_compact_percentage(self):
         snapshot = self.snapshot(
             primary=overlay.RateWindow("7d", 10080, 1.0, 99, 1784563200),
             secondary=None,
@@ -3757,7 +3757,7 @@ class DisplayWidgetTests(unittest.TestCase):
 
         widgets = overlay.OverlayApp.display_widgets(self.make_app(snapshot))
 
-        self.assertEqual([(widget.key, widget.text) for widget in widgets], [("primary", "7d 99%")])
+        self.assertEqual([(widget.key, widget.text) for widget in widgets], [("primary", "99%")])
         self.assertFalse(any("--" in widget.text for widget in widgets))
 
     def test_legacy_five_hour_and_weekly_windows_render_both(self):
@@ -3773,6 +3773,35 @@ class DisplayWidgetTests(unittest.TestCase):
             [("primary", "5h 90%"), ("secondary", "7d 80%")],
         )
 
+    def test_one_selected_from_two_available_uses_compact_percentage(self):
+        snapshot = self.snapshot(
+            primary=overlay.RateWindow("5h", 300, 10.0, 90, 1784000000),
+            secondary=overlay.RateWindow("7d", 10080, 20.0, 80, 1784563200),
+        )
+
+        widgets = overlay.OverlayApp.display_widgets(
+            self.make_app(snapshot, display_windows=["secondary"])
+        )
+
+        self.assertEqual([(widget.key, widget.text) for widget in widgets], [("secondary", "80%")])
+
+    def test_single_window_keeps_reset_countdown(self):
+        reset_at = 1_000 + (2 * 86400) + (3 * 3600)
+        snapshot = self.snapshot(
+            primary=overlay.RateWindow("7d", 10080, 1.0, 99, reset_at),
+            secondary=None,
+        )
+
+        with mock.patch.object(overlay.time, "time", return_value=1_000):
+            widgets = overlay.OverlayApp.display_widgets(
+                self.make_app(snapshot, show_resets=True)
+            )
+
+        self.assertEqual(
+            [(widget.key, widget.text) for widget in widgets],
+            [("primary", "99% reset 2d 3h")],
+        )
+
     def test_stale_missing_slot_selection_renders_available_window(self):
         snapshot = self.snapshot(
             primary=overlay.RateWindow("7d", 10080, 1.0, 99, 1784563200),
@@ -3783,7 +3812,7 @@ class DisplayWidgetTests(unittest.TestCase):
             self.make_app(snapshot, display_windows=["secondary"])
         )
 
-        self.assertEqual([(widget.key, widget.text) for widget in widgets], [("primary", "7d 99%")])
+        self.assertEqual([(widget.key, widget.text) for widget in widgets], [("primary", "99%")])
 
     def test_no_rate_data_renders_one_waiting_message(self):
         widgets = overlay.OverlayApp.display_widgets(self.make_app(None))
