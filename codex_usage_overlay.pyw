@@ -29,7 +29,7 @@ from typing import Any, Callable
 
 
 APP_NAME = "Codex Usage Overlay"
-APP_VERSION = "0.1.10"
+APP_VERSION = "0.1.11"
 SETTINGS_FILE_NAME = "codex_usage_overlay.settings.json"
 RUNTIME_STATE_FILE_NAME = "codex-usage-overlay-state.json"
 INSTANCE_LOCK_FILE_NAME = "codex-usage-overlay.lock"
@@ -4056,6 +4056,7 @@ class OverlayApp:
     def display_widgets(self) -> list[DisplayWidget]:
         widgets: list[DisplayWidget] = []
         selected = effective_display_windows(self.settings, self.snapshot)
+        include_window_label = len(selected) > 1
         show_resets = bool(self.settings.get("show_resets", False))
         if not selected:
             widgets.append(DisplayWidget("rate_waiting", "Waiting for Codex rate data", COLOR_MUTED))
@@ -4071,7 +4072,11 @@ class OverlayApp:
             widgets.append(
                 DisplayWidget(
                     key,
-                    self.format_window_text(rate_window, show_resets),
+                    self.format_window_text(
+                        rate_window,
+                        show_resets,
+                        include_window_label,
+                    ),
                     color,
                 )
             )
@@ -4093,9 +4098,17 @@ class OverlayApp:
 
         return widgets
 
-    def format_window_text(self, rate_window: RateWindow, show_resets: bool) -> str:
+    def format_window_text(
+        self,
+        rate_window: RateWindow,
+        show_resets: bool,
+        include_window_label: bool,
+    ) -> str:
         remaining = "--" if rate_window.remaining_percent is None else f"{rate_window.remaining_percent}%"
-        text = f"{rate_window.label} {remaining}"
+        if include_window_label or rate_window.remaining_percent is None:
+            text = f"{rate_window.label} {remaining}"
+        else:
+            text = remaining
         if show_resets:
             text += f" reset {format_reset_countdown(rate_window.resets_at)}"
         return text

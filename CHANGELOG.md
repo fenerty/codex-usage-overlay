@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.11 - 2026-09-01
+
+- Omit the rate-window label when exactly one effective window has a known
+  remaining percentage, so current weekly-only telemetry renders as `33%`
+  instead of `7d 33%`.
+- Apply the same compact display when a user selects one of two available
+  windows, while preserving labels for multiple displayed windows and for
+  telemetry without a usable percentage.
+- Preserve optional reset countdowns, diagnostic labels, settings behavior,
+  runtime state, and command-line status output.
+
 ## 0.1.10 - 2026-08-29
 
 - Open the custom context menu on right-button release and keep the overlay
