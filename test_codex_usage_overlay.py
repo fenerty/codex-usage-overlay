@@ -25,9 +25,12 @@ def token_count_line(
     last_usage=None,
     total_usage=None,
     include_rate_limits=True,
+    limit_id="codex",
+    limit_name=None,
 ):
     rate_limits = {
-        "limit_id": "codex",
+        "limit_id": limit_id,
+        "limit_name": limit_name,
         "primary": primary,
         "secondary": secondary,
         "plan_type": "prolite",
@@ -156,8 +159,68 @@ class RateParserTests(unittest.TestCase):
         self.assertIsNotNone(snapshot)
         self.assertEqual(snapshot.primary.remaining_percent, 80)
         self.assertEqual(snapshot.secondary.remaining_percent, 88)
+        self.assertEqual(snapshot.limit_id, "codex")
+        self.assertIsNone(snapshot.limit_name)
         self.assertIsNotNone(token_event)
         self.assertEqual(token_event.usage.cached_input_tokens, 800)
+
+    def test_ignores_spark_rate_bucket_but_keeps_token_usage(self):
+        line = token_count_line(
+            "2026-09-03T15:52:42.441Z",
+            primary={"used_percent": 0, "window_minutes": 300},
+            secondary={"used_percent": 0, "window_minutes": 10080},
+            last_usage={"total_tokens": 1_200},
+            limit_id="codex_bengalfox",
+            limit_name="GPT-5.3-Codex-Spark",
+        )
+
+        self.assertIsNone(overlay.parse_rate_line(line))
+        token_event = overlay.parse_token_event_line(line)
+        self.assertIsNotNone(token_event)
+        self.assertEqual(token_event.usage.total_tokens, 1_200)
+
+    def test_accepts_unnamed_legacy_event_as_main_limit(self):
+        event = json.loads(
+            token_count_line(
+                "2026-06-01T12:00:00.000Z",
+                primary={"used_percent": 10, "window_minutes": 300},
+                secondary=None,
+            )
+        )
+        event["rate_limits"].pop("limit_id")
+        event["rate_limits"].pop("limit_name")
+
+        snapshot = overlay.parse_rate_line(json.dumps(event))
+
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.limit_id, "codex")
+        self.assertEqual(snapshot.primary.remaining_percent, 90)
+
+    def test_rejects_named_bucket_without_a_limit_id(self):
+        event = json.loads(
+            token_count_line(
+                "2026-09-03T15:52:42.441Z",
+                primary={"used_percent": 0, "window_minutes": 300},
+                secondary={"used_percent": 0, "window_minutes": 10080},
+                limit_name="GPT-5.3-Codex-Spark",
+            )
+        )
+        event["rate_limits"].pop("limit_id")
+
+        self.assertIsNone(overlay.parse_rate_line(json.dumps(event)))
+
+    def test_main_limit_zero_usage_remains_valid(self):
+        snapshot = overlay.parse_rate_line(
+            token_count_line(
+                "2026-06-01T12:00:00.000Z",
+                primary={"used_percent": 0, "window_minutes": 10080},
+                secondary=None,
+            )
+        )
+
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.limit_id, "codex")
+        self.assertEqual(snapshot.primary.remaining_percent, 100)
 
     def test_parses_one_missing_window(self):
         line = token_count_line(
@@ -260,6 +323,72 @@ class RateParserTests(unittest.TestCase):
             self.assertIsNotNone(snapshot)
             self.assertEqual(snapshot.primary.remaining_percent, 92)
             self.assertEqual(snapshot.secondary.remaining_percent, 94)
+
+    def test_newer_spark_event_cannot_replace_main_limit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sessions = Path(temp_dir) / "sessions" / "2026" / "09" / "03"
+            sessions.mkdir(parents=True)
+            path = sessions / "rollout.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        token_count_line(
+                            "2026-09-03T15:52:25.000Z",
+                            primary={"used_percent": 38, "window_minutes": 10080},
+                            secondary=None,
+                        ),
+                        token_count_line(
+                            "2026-09-03T15:52:42.000Z",
+                            primary={"used_percent": 0, "window_minutes": 300},
+                            secondary={"used_percent": 0, "window_minutes": 10080},
+                            limit_id="codex_bengalfox",
+                            limit_name="GPT-5.3-Codex-Spark",
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            snapshot = overlay.RateLogReader(Path(temp_dir)).latest_snapshot(force_rescan=True)
+
+            self.assertIsNotNone(snapshot)
+            self.assertEqual(snapshot.limit_id, "codex")
+            self.assertEqual(snapshot.primary.remaining_percent, 62)
+            self.assertIsNone(snapshot.secondary)
+
+    def test_appended_spark_events_preserve_cached_main_limit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sessions = Path(temp_dir) / "sessions" / "2026" / "09" / "03"
+            sessions.mkdir(parents=True)
+            path = sessions / "rollout.jsonl"
+            path.write_text(
+                token_count_line(
+                    "2026-09-03T15:52:25.000Z",
+                    primary={"used_percent": 38, "window_minutes": 10080},
+                    secondary=None,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            reader = overlay.RateLogReader(Path(temp_dir))
+            first = reader.latest_snapshot(force_rescan=True)
+
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    token_count_line(
+                        "2026-09-03T15:52:42.000Z",
+                        primary={"used_percent": 0, "window_minutes": 300},
+                        secondary={"used_percent": 0, "window_minutes": 10080},
+                        limit_id="codex_bengalfox",
+                        limit_name="GPT-5.3-Codex-Spark",
+                    )
+                    + "\n"
+                )
+            second = reader.latest_snapshot()
+
+            self.assertEqual(first, second)
+            self.assertEqual(second.primary.remaining_percent, 62)
 
     def test_reads_appended_lines_after_initial_read(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -396,6 +525,7 @@ class RateParserTests(unittest.TestCase):
 
         self.assertIsNotNone(snapshot)
         self.assertEqual(snapshot.source_kind, "logs_2.sqlite")
+        self.assertEqual(snapshot.limit_id, "codex")
         self.assertEqual(snapshot.primary.label, "5h")
         self.assertEqual(snapshot.primary.remaining_percent, 79)
         self.assertEqual(snapshot.primary.resets_at, 1780421759)
@@ -1460,6 +1590,7 @@ class RuntimeStateTests(unittest.TestCase):
                 secondary=None,
                 plan_type="prolite",
                 rate_limit_reached_type=None,
+                limit_id="codex",
                 source_path="logs_2.sqlite:1",
                 source_kind="logs_2.sqlite",
                 source_observed_at=1780420843,
@@ -1507,6 +1638,7 @@ class RuntimeStateTests(unittest.TestCase):
             self.assertEqual(state["source_event_timestamp"], "2026-06-02T17:20:43+00:00")
             self.assertEqual(state["source_observed_at"], 1780420843)
             self.assertIn("source_age_seconds", state)
+            self.assertEqual(state["last_rate_snapshot"]["limit_id"], "codex")
             self.assertEqual(state["last_rate_snapshot"]["source_kind"], "logs_2.sqlite")
             self.assertEqual(state["runtime"], diagnostics)
 

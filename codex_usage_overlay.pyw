@@ -29,10 +29,11 @@ from typing import Any, Callable
 
 
 APP_NAME = "Codex Usage Overlay"
-APP_VERSION = "0.1.11"
+APP_VERSION = "0.1.12"
 SETTINGS_FILE_NAME = "codex_usage_overlay.settings.json"
 RUNTIME_STATE_FILE_NAME = "codex-usage-overlay-state.json"
 INSTANCE_LOCK_FILE_NAME = "codex-usage-overlay.lock"
+MAIN_RATE_LIMIT_ID = "codex"
 DEFAULT_DISPLAY_WINDOWS = ("primary", "secondary")
 VALID_DISPLAY_WINDOWS = ("primary", "secondary")
 DEFAULT_LAYOUT_MODE = "horizontal"
@@ -140,6 +141,8 @@ class RateSnapshot:
     secondary: RateWindow | None
     plan_type: str | None
     rate_limit_reached_type: str | None
+    limit_id: str | None = None
+    limit_name: str | None = None
     source_path: str | None = None
     source_kind: str = "session_jsonl"
     source_observed_at: float | None = None
@@ -393,6 +396,35 @@ def parse_rate_window(raw: Any, fallback_label: str = "limit") -> RateWindow | N
     )
 
 
+def optional_text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def main_rate_limit_identity(
+    rate_limits: dict[str, Any],
+    parent: dict[str, Any] | None = None,
+) -> tuple[str | None, str | None]:
+    parent = parent or {}
+    limit_id = optional_text(rate_limits.get("limit_id"))
+    if limit_id is None:
+        limit_id = optional_text(parent.get("limit_id"))
+    if limit_id is not None:
+        limit_id = limit_id.lower()
+
+    limit_name = optional_text(rate_limits.get("limit_name"))
+    if limit_name is None:
+        limit_name = optional_text(parent.get("limit_name"))
+
+    # Historical main-limit events predate explicit allowance identities.
+    # Treat only fully unnamed events as the legacy main Codex allowance.
+    if limit_id is None and limit_name is None:
+        limit_id = MAIN_RATE_LIMIT_ID
+    return limit_id, limit_name
+
+
 def parse_rate_line(
     line: str,
     source_path: str | None = None,
@@ -420,6 +452,10 @@ def parse_rate_line(
     if not isinstance(rate_limits, dict):
         return None
 
+    limit_id, limit_name = main_rate_limit_identity(rate_limits, payload)
+    if limit_id != MAIN_RATE_LIMIT_ID:
+        return None
+
     primary = parse_rate_window(rate_limits.get("primary"))
     secondary = parse_rate_window(rate_limits.get("secondary"))
     if primary is None and secondary is None:
@@ -431,6 +467,8 @@ def parse_rate_line(
         secondary=secondary,
         plan_type=rate_limits.get("plan_type"),
         rate_limit_reached_type=rate_limits.get("rate_limit_reached_type"),
+        limit_id=limit_id,
+        limit_name=limit_name,
         source_path=source_path,
         source_kind=source_kind,
         source_observed_at=source_observed_at,
@@ -857,6 +895,10 @@ def parse_sqlite_rate_limit_log_body(
     if not isinstance(rate_limits, dict):
         return None
 
+    limit_id, limit_name = main_rate_limit_identity(rate_limits, payload)
+    if limit_id != MAIN_RATE_LIMIT_ID:
+        return None
+
     primary = parse_rate_window(rate_limits.get("primary"))
     secondary = parse_rate_window(rate_limits.get("secondary"))
     if primary is None and secondary is None:
@@ -872,6 +914,8 @@ def parse_sqlite_rate_limit_log_body(
         secondary=secondary,
         plan_type=payload.get("plan_type"),
         rate_limit_reached_type=reached_type,
+        limit_id=limit_id,
+        limit_name=limit_name,
         source_path=source_path,
         source_kind="logs_2.sqlite",
         source_observed_at=observed_at,
@@ -2336,6 +2380,8 @@ def rate_snapshot_to_dict(snapshot: RateSnapshot | None) -> dict[str, Any] | Non
         return None
     return {
         "timestamp": snapshot.timestamp,
+        "limit_id": snapshot.limit_id,
+        "limit_name": snapshot.limit_name,
         "primary": rate_window_to_dict(snapshot.primary),
         "secondary": rate_window_to_dict(snapshot.secondary),
         "plan_type": snapshot.plan_type,
