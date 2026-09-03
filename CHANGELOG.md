@@ -4,6 +4,8 @@
 
 - Track the main `codex` allowance by its rate-limit identity and ignore
   separate model-specific buckets such as GPT-5.3-Codex-Spark.
+- Page backward through SQLite rate events until the latest main or legacy
+  snapshot is found, even after a burst of newer model-specific events.
 - Prevent newer Spark rate events from replacing the cached main Codex
   percentage while preserving model-independent token counting.
 - Continue accepting unnamed legacy main-limit events and legitimate 100%

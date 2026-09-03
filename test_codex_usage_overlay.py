@@ -59,6 +59,8 @@ def websocket_rate_log(
     plan_type="prolite",
     limit_reached=False,
     additional_rate_limits=None,
+    limit_id=None,
+    limit_name=None,
 ):
     payload = {
         "type": "codex.rate_limits",
@@ -72,6 +74,10 @@ def websocket_rate_log(
         "code_review_rate_limits": None,
         "additional_rate_limits": additional_rate_limits,
     }
+    if limit_id is not None:
+        payload["rate_limits"]["limit_id"] = limit_id
+    if limit_name is not None:
+        payload["rate_limits"]["limit_name"] = limit_name
     return "stream_request: websocket event: " + json.dumps(payload) + " transport=responses_websocket"
 
 
@@ -726,7 +732,15 @@ class RateParserTests(unittest.TestCase):
 class IncrementalSqliteReaderTests(unittest.TestCase):
     TARGET = "codex_api::endpoint::responses_websocket"
 
-    def row(self, timestamp, used_percent, target=None, body=None):
+    def row(
+        self,
+        timestamp,
+        used_percent,
+        target=None,
+        body=None,
+        limit_id=None,
+        limit_name=None,
+    ):
         return (
             timestamp,
             target or self.TARGET,
@@ -734,6 +748,8 @@ class IncrementalSqliteReaderTests(unittest.TestCase):
             or websocket_rate_log(
                 primary={"used_percent": used_percent, "window_minutes": 300},
                 secondary=None,
+                limit_id=limit_id,
+                limit_name=limit_name,
             ),
         )
 
@@ -775,6 +791,55 @@ class IncrementalSqliteReaderTests(unittest.TestCase):
             self.assertEqual(unchanged, updated)
             self.assertEqual(parse_body.call_count, 1)
             self.assertEqual(reader._last_row_id, 2)
+
+    def test_full_rescan_pages_past_newer_model_specific_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "logs_2.sqlite"
+            rows = [self.row(1_000, 20, limit_id="codex")]
+            rows.extend(
+                self.row(
+                    1_001 + index,
+                    0,
+                    limit_id="codex_bengalfox",
+                    limit_name="GPT-5.3-Codex-Spark",
+                )
+                for index in range(overlay.SQLITE_RATE_ROWS_TO_SCAN + 1)
+            )
+            create_logs_db(path, rows)
+            reader = overlay.SqliteRateLimitReader(path)
+
+            snapshot = reader.latest_snapshot(force_rescan=True, now=0)
+
+            self.assertIsNotNone(snapshot)
+            self.assertEqual(snapshot.limit_id, "codex")
+            self.assertEqual(snapshot.primary.remaining_percent, 80)
+            self.assertEqual(reader._last_row_id, overlay.SQLITE_RATE_ROWS_TO_SCAN + 2)
+
+    def test_incremental_read_pages_past_newer_model_specific_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "logs_2.sqlite"
+            create_logs_db(path, [self.row(1_000, 20, limit_id="codex")])
+            reader = overlay.SqliteRateLimitReader(path)
+            reader.latest_snapshot(row_limit=2, force_rescan=True, now=0)
+            append_logs_db(
+                path,
+                [self.row(1_001, 30, limit_id="codex")]
+                + [
+                    self.row(
+                        1_002 + index,
+                        0,
+                        limit_id="codex_bengalfox",
+                        limit_name="GPT-5.3-Codex-Spark",
+                    )
+                    for index in range(3)
+                ],
+            )
+
+            snapshot = reader.latest_snapshot(row_limit=2, now=0.5)
+
+            self.assertEqual(snapshot.limit_id, "codex")
+            self.assertEqual(snapshot.primary.remaining_percent, 70)
+            self.assertEqual(reader._last_row_id, 5)
 
     def test_malformed_row_advances_checkpoint_and_later_valid_row_wins(self):
         malformed = (

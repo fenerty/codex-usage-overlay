@@ -1045,55 +1045,47 @@ class SqliteRateLimitReader:
                 or row_id_rolled_back
             )
 
-            if full_rescan:
-                rows = connection.execute(
-                    """
-                    SELECT id, ts, target, feedback_log_body
-                    FROM logs
-                    WHERE feedback_log_body LIKE ?
-                      AND feedback_log_body LIKE ?
-                    ORDER BY id DESC
-                    LIMIT ?
-                    """,
-                    (
-                        f"%{SQLITE_RATE_LOG_MARKER}%",
-                        f"%{SQLITE_RATE_EVENT_TYPE}%",
-                        row_limit,
-                    ),
-                )
-            elif max_row_id > self._last_row_id:
+            snapshots: list[RateSnapshot] = []
+            lower_row_id = 0 if full_rescan else self._last_row_id
+            before_row_id = max_row_id + 1
+            page_size = max(1, parse_int(row_limit) or SQLITE_RATE_ROWS_TO_SCAN)
+            while max_row_id > lower_row_id and before_row_id > lower_row_id + 1:
                 rows = connection.execute(
                     """
                     SELECT id, ts, target, feedback_log_body
                     FROM logs
                     WHERE id > ?
+                      AND id < ?
+                      AND target = ?
                       AND feedback_log_body LIKE ?
                       AND feedback_log_body LIKE ?
                     ORDER BY id DESC
                     LIMIT ?
                     """,
                     (
-                        self._last_row_id,
+                        lower_row_id,
+                        before_row_id,
+                        "codex_api::endpoint::responses_websocket",
                         f"%{SQLITE_RATE_LOG_MARKER}%",
                         f"%{SQLITE_RATE_EVENT_TYPE}%",
-                        row_limit,
+                        page_size,
                     ),
-                )
-            else:
-                rows = ()
+                ).fetchall()
+                if not rows:
+                    break
 
-            snapshots: list[RateSnapshot] = []
-            for row_id, observed_at, target, body in rows:
-                if target != "codex_api::endpoint::responses_websocket":
-                    continue
-                try:
-                    observed_float = float(observed_at)
-                except (TypeError, ValueError):
-                    observed_float = None
-                source_path = f"{self.path}:{row_id}"
-                snapshot = parse_sqlite_rate_limit_log_body(body, observed_float, source_path)
-                if snapshot is not None:
-                    snapshots.append(snapshot)
+                for row_id, observed_at, _target, body in rows:
+                    try:
+                        observed_float = float(observed_at)
+                    except (TypeError, ValueError):
+                        observed_float = None
+                    source_path = f"{self.path}:{row_id}"
+                    snapshot = parse_sqlite_rate_limit_log_body(body, observed_float, source_path)
+                    if snapshot is not None:
+                        snapshots.append(snapshot)
+                if snapshots or len(rows) < page_size:
+                    break
+                before_row_id = min(row[0] for row in rows)
             if snapshots:
                 newest = max(snapshots, key=timestamp_sort_key)
                 if (
