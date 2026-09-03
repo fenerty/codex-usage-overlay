@@ -3,19 +3,21 @@
 A tiny, dependency-free desktop overlay for local Codex usage signals.
 
 `codex-usage-overlay` reads Codex's local session JSONL files and local telemetry
-database to show reported remaining rate-limit percentages, reset countdowns, a
-manual token counter, and an optional API-equivalent cost estimate. It is built
-as a single Python/Tkinter `.pyw` app so it can run quietly on Windows without a
-console window.
+database to show the main Codex allowance's reported remaining rate-limit
+percentages, reset countdowns, a manual token counter, and an optional
+API-equivalent cost estimate. It is built as a single Python/Tkinter `.pyw` app
+so it can run quietly on Windows without a console window.
 
 This is an independent utility and is not an official OpenAI or Codex project.
 
 ## Features
 
 - Always-on-top, draggable, translucent Tkinter overlay.
-- Shows whichever Codex rate-limit windows are present in local telemetry. One
-  effective window renders as a compact percentage such as `33%`; legacy 5-hour
-  plus weekly telemetry still renders both windows with their labels.
+- Shows whichever rate-limit windows are present for the main `codex` allowance.
+  One effective window renders as a compact percentage such as `33%`; legacy
+  5-hour plus weekly telemetry still renders both windows with their labels.
+- Ignores separate model-specific allowance buckets such as
+  GPT-5.3-Codex-Spark, so they cannot replace the main Codex percentage.
 - Uses the freshest local source available: `logs_2.sqlite` rate-limit websocket
   events first, session JSONL rate events as fallback.
 - Optional reset countdowns in the overlay.
@@ -144,6 +146,8 @@ paths and raw transcript content are not written.
 
 - Codex local log formats are unofficial implementation details and may change.
 - Displayed rate limits are only as fresh as the local Codex logs.
+- The rate display intentionally tracks only the main `codex` allowance. Token
+  counting remains model-independent.
 - The API cost estimate is approximate and is not actual Codex subscription
   billing.
 - GPT-5.6 Sol, Terra, and Luna use their published short- and long-context

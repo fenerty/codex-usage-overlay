@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.12 - 2026-09-03
+
+- Track the main `codex` allowance by its rate-limit identity and ignore
+  separate model-specific buckets such as GPT-5.3-Codex-Spark.
+- Page backward through SQLite rate events until the latest main or legacy
+  snapshot is found, even after a burst of newer model-specific events.
+- Prevent newer Spark rate events from replacing the cached main Codex
+  percentage while preserving model-independent token counting.
+- Continue accepting unnamed legacy main-limit events and legitimate 100%
+  remaining snapshots after a main allowance reset.
+- Include the accepted rate-limit identity in runtime diagnostics.
+
 ## 0.1.11 - 2026-09-01
 
 - Omit the rate-window label when exactly one effective window has a known
