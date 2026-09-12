@@ -22,14 +22,14 @@ import sys
 import tempfile
 import time
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 
 APP_NAME = "Codex Usage Overlay"
-APP_VERSION = "0.1.12"
+APP_VERSION = "0.1.13"
 SETTINGS_FILE_NAME = "codex_usage_overlay.settings.json"
 RUNTIME_STATE_FILE_NAME = "codex-usage-overlay-state.json"
 INSTANCE_LOCK_FILE_NAME = "codex-usage-overlay.lock"
@@ -49,6 +49,8 @@ WINDOWS_CODEX_PACKAGE_BUILD_RE = re.compile(
 )
 DEFAULT_OPACITY = 0.9
 POLL_INTERVAL_MS = 500
+RATE_DATA_STALE_AFTER_SECONDS = 300
+RATE_SOURCE_FUTURE_TOLERANCE_SECONDS = 5
 HIDDEN_POLL_INTERVAL_MS = 1_000
 HIDDEN_LOG_POLL_INTERVAL_SECONDS = 5
 PROCESS_VISIBILITY_POLL_INTERVAL_SECONDS = 1
@@ -146,6 +148,7 @@ class RateSnapshot:
     source_path: str | None = None
     source_kind: str = "session_jsonl"
     source_observed_at: float | None = None
+    clock_mismatch: bool = False
 
 
 @dataclass(frozen=True)
@@ -264,35 +267,45 @@ class LogReadBatch:
     token_events: list[TokenEvent]
 
 
-# Current official OpenAI Standard API prices, per 1M text tokens.
+# Official OpenAI Standard API prices, per 1M text tokens.
+# Astra and GPT-5.6 rates verified 2026-09-12; Sol includes promotional pricing.
 # Source: https://developers.openai.com/api/docs/pricing
 API_MODEL_PRICING = {
-    "gpt-5.6-sol": ModelPricing(
-        "gpt-5.6 Sol", 5.00, 0.50, 30.00, API_PRICING_SOURCE_URL,
-        cache_write_per_million=6.25,
+    "gpt-6-astra": ModelPricing(
+        "gpt-6 Astra", 10.00, 1.00, 50.00, API_PRICING_SOURCE_URL,
+        cache_write_per_million=12.50,
         long_context_threshold_tokens=LONG_CONTEXT_INPUT_THRESHOLD_TOKENS,
-        long_context_input_per_million=10.00,
-        long_context_cached_input_per_million=1.00,
-        long_context_cache_write_per_million=12.50,
-        long_context_output_per_million=45.00,
+        long_context_input_per_million=20.00,
+        long_context_cached_input_per_million=2.00,
+        long_context_cache_write_per_million=25.00,
+        long_context_output_per_million=75.00,
+    ),
+    "gpt-5.6-sol": ModelPricing(
+        "gpt-5.6 Sol", 4.00, 0.40, 20.00, API_PRICING_SOURCE_URL,
+        cache_write_per_million=5.00,
+        long_context_threshold_tokens=LONG_CONTEXT_INPUT_THRESHOLD_TOKENS,
+        long_context_input_per_million=8.00,
+        long_context_cached_input_per_million=0.80,
+        long_context_cache_write_per_million=10.00,
+        long_context_output_per_million=30.00,
     ),
     "gpt-5.6-terra": ModelPricing(
-        "gpt-5.6 Terra", 2.50, 0.25, 15.00, API_PRICING_SOURCE_URL,
-        cache_write_per_million=3.125,
+        "gpt-5.6 Terra", 2.00, 0.20, 12.00, API_PRICING_SOURCE_URL,
+        cache_write_per_million=2.50,
         long_context_threshold_tokens=LONG_CONTEXT_INPUT_THRESHOLD_TOKENS,
-        long_context_input_per_million=5.00,
-        long_context_cached_input_per_million=0.50,
-        long_context_cache_write_per_million=6.25,
-        long_context_output_per_million=22.50,
+        long_context_input_per_million=4.00,
+        long_context_cached_input_per_million=0.40,
+        long_context_cache_write_per_million=5.00,
+        long_context_output_per_million=18.00,
     ),
     "gpt-5.6-luna": ModelPricing(
-        "gpt-5.6 Luna", 1.00, 0.10, 6.00, API_PRICING_SOURCE_URL,
-        cache_write_per_million=1.25,
+        "gpt-5.6 Luna", 0.20, 0.02, 1.20, API_PRICING_SOURCE_URL,
+        cache_write_per_million=0.25,
         long_context_threshold_tokens=LONG_CONTEXT_INPUT_THRESHOLD_TOKENS,
-        long_context_input_per_million=2.00,
-        long_context_cached_input_per_million=0.20,
-        long_context_cache_write_per_million=2.50,
-        long_context_output_per_million=9.00,
+        long_context_input_per_million=0.40,
+        long_context_cached_input_per_million=0.04,
+        long_context_cache_write_per_million=0.50,
+        long_context_output_per_million=1.80,
     ),
     "gpt-5.5": ModelPricing(
         "gpt-5.5", 5.00, 0.50, 30.00, API_PRICING_SOURCE_URL,
@@ -740,7 +753,7 @@ def format_model_name(model: str | None) -> str:
 
 def format_api_cost_estimate(estimate: ApiCostEstimate) -> str:
     if estimate.total_cost is None:
-        return "API est. --"
+        return "API est. unpriced" if estimate.model else "API est. --"
     if estimate.pricing_is_proxy:
         return f"{format_api_cost(estimate.total_cost)} API est. ({format_model_name(estimate.pricing_model)} proxy)"
     return f"{format_api_cost(estimate.total_cost)} API est."
@@ -1121,6 +1134,7 @@ class RateLogReader:
         self._last_snapshot: RateSnapshot | None = None
         self._last_full_session_scan_at: float | None = None
         self.last_error: str | None = None
+        self._clock_mismatch = False
 
     def read_updates(
         self,
@@ -1155,6 +1169,10 @@ class RateLogReader:
                 newest = max(snapshots, key=timestamp_sort_key)
                 if self._last_snapshot is None or timestamp_sort_key(newest) >= timestamp_sort_key(self._last_snapshot):
                     self._last_snapshot = newest
+            if snapshot_clock_mismatch(self._last_snapshot):
+                self._clock_mismatch = True
+            if self._last_snapshot is not None and self._clock_mismatch:
+                self._last_snapshot = replace(self._last_snapshot, clock_mismatch=True)
             return LogReadBatch(snapshot=self._last_snapshot, token_events=token_events)
         except Exception as exc:  # Defensive: never let a log race crash the overlay.
             self.last_error = str(exc)
@@ -2393,7 +2411,49 @@ def snapshot_source_age_seconds(snapshot: RateSnapshot | None, now: float | None
     if source_time is None:
         return None
     current = time.time() if now is None else now
+    if source_time > current + RATE_SOURCE_FUTURE_TOLERANCE_SECONDS:
+        # Clock corrections and future-dated logs must not extend freshness.
+        return None
     return max(0, int(current - source_time))
+
+
+def rate_data_status(snapshot: RateSnapshot | None, now: float | None = None) -> str:
+    if snapshot is None:
+        return "missing"
+    if snapshot_clock_mismatch(snapshot, now):
+        return "clock_mismatch"
+    age = snapshot_source_age_seconds(snapshot, now)
+    if age is None or age >= RATE_DATA_STALE_AFTER_SECONDS:
+        return "stale"
+    return "recent"
+
+
+def rate_window_status(snapshot: RateSnapshot | None, window: RateWindow, now: float | None = None) -> str:
+    current = time.time() if now is None else now
+    if snapshot_clock_mismatch(snapshot, current):
+        return "clock_mismatch"
+    if window.resets_at is not None and current >= window.resets_at:
+        return "reset_pending"
+    return rate_data_status(snapshot, current)
+
+
+def snapshot_clock_mismatch(snapshot: RateSnapshot | None, now: float | None = None) -> bool:
+    if snapshot is None:
+        return False
+    current = time.time() if now is None else now
+    times = (timestamp_to_epoch(snapshot.timestamp), snapshot.source_observed_at)
+    return snapshot.clock_mismatch or any(
+        value is not None and value > current + RATE_SOURCE_FUTURE_TOLERANCE_SECONDS
+        for value in times
+    )
+
+
+def snapshot_has_active_limit(snapshot: RateSnapshot | None) -> bool:
+    if snapshot is None or not snapshot.rate_limit_reached_type:
+        return False
+    windows = [getattr(snapshot, key) for key in available_rate_window_keys(snapshot)]
+    # The flag is snapshot-wide; do not guess which window caused it.
+    return bool(windows) and all(rate_window_status(snapshot, window) == "recent" for window in windows)
 
 
 def runtime_state_path() -> Path:
@@ -2567,6 +2627,12 @@ class RuntimeStateStore:
             "source_event_timestamp": snapshot.timestamp if snapshot else None,
             "source_observed_at": snapshot.source_observed_at if snapshot else None,
             "source_age_seconds": snapshot_source_age_seconds(snapshot, now),
+            "rate_data_status": rate_data_status(snapshot, now),
+            "rate_window_status": {
+                key: rate_window_status(snapshot, window, now)
+                for key in VALID_DISPLAY_WINDOWS
+                if snapshot is not None and (window := getattr(snapshot, key)) is not None
+            },
             "last_rate_snapshot": rate_snapshot_to_dict(snapshot),
             "token_counter": counter.state_dict(),
             "api_cost_estimate": api_cost_estimate_to_dict(api_cost_estimate),
@@ -4094,9 +4160,13 @@ class OverlayApp:
     def display_widgets(self) -> list[DisplayWidget]:
         widgets: list[DisplayWidget] = []
         selected = effective_display_windows(self.settings, self.snapshot)
+        clock_mismatch = snapshot_clock_mismatch(self.snapshot)
+        if clock_mismatch:
+            widgets.append(DisplayWidget("rate_clock_mismatch", "Usage unavailable - clock mismatch", COLOR_AMBER))
+            selected = []
         include_window_label = len(selected) > 1
         show_resets = bool(self.settings.get("show_resets", False))
-        if not selected:
+        if not selected and not clock_mismatch:
             widgets.append(DisplayWidget("rate_waiting", "Waiting for Codex rate data", COLOR_MUTED))
         for key in selected:
             rate_window = self.get_window(key)
@@ -4107,6 +4177,8 @@ class OverlayApp:
                 if rate_window.remaining_percent is None
                 else percent_color(rate_window.remaining_percent)
             )
+            if rate_window_status(self.snapshot, rate_window) != "recent":
+                color = COLOR_AMBER
             widgets.append(
                 DisplayWidget(
                     key,
@@ -4119,7 +4191,7 @@ class OverlayApp:
                 )
             )
 
-        if self.snapshot and self.snapshot.rate_limit_reached_type:
+        if snapshot_has_active_limit(self.snapshot):
             if widgets:
                 first = widgets[0]
                 widgets[0] = DisplayWidget(first.key, f"{first.text} LIMIT", COLOR_RED)
@@ -4142,11 +4214,17 @@ class OverlayApp:
         show_resets: bool,
         include_window_label: bool,
     ) -> str:
+        status = rate_window_status(self.snapshot, rate_window)
+        if status == "reset_pending":
+            prefix = f"{rate_window.label} " if include_window_label else ""
+            return f"{prefix}-- reset pending"
         remaining = "--" if rate_window.remaining_percent is None else f"{rate_window.remaining_percent}%"
         if include_window_label or rate_window.remaining_percent is None:
             text = f"{rate_window.label} {remaining}"
         else:
             text = remaining
+        if status == "stale":
+            text += " stale"
         if show_resets:
             text += f" reset {format_reset_countdown(rate_window.resets_at)}"
         return text
@@ -4505,6 +4583,13 @@ class OverlayApp:
                         if rate_window.remaining_percent is None
                         else f"{rate_window.remaining_percent}% remaining"
                     )
+                    status = rate_window_status(self.snapshot, rate_window)
+                    if status == "clock_mismatch":
+                        value = "Usage unavailable - clock mismatch"
+                    elif status == "reset_pending":
+                        value = "-- reset pending"
+                    elif status == "stale":
+                        value += " stale"
                     rows.append(
                         MenuRow.disabled(
                             f"{rate_window.label}: {value}, resets {format_reset_time(rate_window.resets_at)}"
@@ -4605,7 +4690,7 @@ class OverlayApp:
         if self.snapshot is None:
             return "Rate source: unknown"
         age = snapshot_source_age_seconds(self.snapshot)
-        return f"Rate source: {self.snapshot.source_kind}, {format_age_seconds(age)}"
+        return f"Rate source: {self.snapshot.source_kind}, {format_age_seconds(age)} ({rate_data_status(self.snapshot)})"
 
     def set_visibility_mode(self, mode: str) -> None:
         if not self.process_backend.is_supported(mode):
@@ -4728,12 +4813,20 @@ def print_status() -> int:
     if snapshot is None:
         print("No Codex rate data found.")
         return 1
+    if snapshot_clock_mismatch(snapshot):
+        print("Usage unavailable - clock mismatch")
+        return 0
     parts = []
     for key in VALID_DISPLAY_WINDOWS:
         rate_window = snapshot.primary if key == "primary" else snapshot.secondary
         if rate_window and rate_window.remaining_percent is not None:
-            parts.append(f"{rate_window.label} {rate_window.remaining_percent}%")
-    if snapshot.rate_limit_reached_type:
+            status = rate_window_status(snapshot, rate_window)
+            if status == "reset_pending":
+                parts.append(f"{rate_window.label} -- reset pending")
+            else:
+                suffix = " stale" if status == "stale" else ""
+                parts.append(f"{rate_window.label} {rate_window.remaining_percent}%{suffix}")
+    if snapshot_has_active_limit(snapshot):
         parts.append("LIMIT")
     print("  ".join(parts) or "No usable Codex rate windows found.")
     return 0
