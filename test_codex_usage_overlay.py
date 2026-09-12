@@ -1461,7 +1461,7 @@ class ApiCostEstimateTests(unittest.TestCase):
         self.assertIsNone(estimate.pricing_model)
         self.assertFalse(estimate.pricing_is_proxy)
         self.assertIsNone(estimate.total_cost)
-        self.assertEqual(overlay.format_api_cost_estimate(estimate), "API est. --")
+        self.assertEqual(overlay.format_api_cost_estimate(estimate), "API est. unpriced")
 
     def test_uses_exact_gpt_54_mini_pricing(self):
         estimate = overlay.estimate_api_cost(
@@ -1481,11 +1481,12 @@ class ApiCostEstimateTests(unittest.TestCase):
         self.assertAlmostEqual(estimate.output_cost, 4.50)
         self.assertAlmostEqual(estimate.total_cost, 5.115)
 
-    def test_gpt_56_models_use_exact_published_standard_rates(self):
+    def test_current_models_use_exact_published_standard_rates(self):
         expected = {
-            "gpt-5.6-sol": (5.00, 0.50, 6.25, 30.00, 10.00, 1.00, 12.50, 45.00),
-            "gpt-5.6-terra": (2.50, 0.25, 3.125, 15.00, 5.00, 0.50, 6.25, 22.50),
-            "gpt-5.6-luna": (1.00, 0.10, 1.25, 6.00, 2.00, 0.20, 2.50, 9.00),
+            "gpt-6-astra": (10.00, 1.00, 12.50, 50.00, 20.00, 2.00, 25.00, 75.00),
+            "gpt-5.6-sol": (4.00, 0.40, 5.00, 20.00, 8.00, 0.80, 10.00, 30.00),
+            "gpt-5.6-terra": (2.00, 0.20, 2.50, 12.00, 4.00, 0.40, 5.00, 18.00),
+            "gpt-5.6-luna": (0.20, 0.02, 0.25, 1.20, 0.40, 0.04, 0.50, 1.80),
         }
 
         for model, rates in expected.items():
@@ -1556,10 +1557,10 @@ class ApiCostEstimateTests(unittest.TestCase):
             long_context_request_count=1,
         )
 
-        self.assertAlmostEqual(estimate.input_cost, 2.30)
-        self.assertAlmostEqual(estimate.cached_input_cost, 0.12)
-        self.assertAlmostEqual(estimate.output_cost, 1.20)
-        self.assertAlmostEqual(estimate.total_cost, 3.62)
+        self.assertAlmostEqual(estimate.input_cost, 1.84)
+        self.assertAlmostEqual(estimate.cached_input_cost, 0.096)
+        self.assertAlmostEqual(estimate.output_cost, 0.80)
+        self.assertAlmostEqual(estimate.total_cost, 2.736)
         self.assertEqual(estimate.long_context_request_count, 1)
         self.assertIsNone(estimate.cache_write_cost)
 
@@ -1577,7 +1578,29 @@ class ApiCostEstimateTests(unittest.TestCase):
 
         self.assertEqual(estimate.uncached_input_tokens, 0)
         self.assertEqual(estimate.cached_input_tokens, 300_100)
-        self.assertAlmostEqual(estimate.cached_input_cost, 0.06001)
+        self.assertAlmostEqual(estimate.cached_input_cost, 0.012002)
+
+    def test_astra_prices_short_and_long_requests_without_double_counting_reasoning(self):
+        short = overlay.TokenUsage(input_tokens=100_000, cached_input_tokens=40_000,
+                                   output_tokens=10_000, reasoning_output_tokens=5_000)
+        long = overlay.TokenUsage(input_tokens=300_000, cached_input_tokens=100_000,
+                                  output_tokens=20_000, reasoning_output_tokens=10_000)
+        estimate = overlay.estimate_api_cost(
+            overlay.add_token_usage(short, long), overlay.DetectedModel("gpt-6-astra", "test"),
+            short_context_usage=short, long_context_usage=long, long_context_request_count=1,
+        )
+        self.assertEqual(estimate.pricing_model, "gpt-6-astra")
+        self.assertFalse(estimate.pricing_is_proxy)
+        self.assertAlmostEqual(estimate.input_cost, 4.60)
+        self.assertAlmostEqual(estimate.cached_input_cost, 0.24)
+        self.assertAlmostEqual(estimate.output_cost, 2.00)
+        self.assertAlmostEqual(estimate.total_cost, 6.84)
+        self.assertIsNone(estimate.cache_write_cost)
+        self.assertEqual(overlay.format_api_cost_estimate(estimate), "$6.84 API est.")
+
+    def test_no_detected_model_still_shows_waiting_estimate(self):
+        estimate = overlay.estimate_api_cost(overlay.TokenUsage(), overlay.DetectedModel(None, "test"))
+        self.assertEqual(overlay.format_api_cost_estimate(estimate), "API est. --")
 
     def test_formats_costs(self):
         self.assertEqual(overlay.format_api_cost(0), "$0.00")
@@ -1687,11 +1710,11 @@ class RuntimeStateTests(unittest.TestCase):
             )
             self.assertEqual(
                 state["api_cost_estimate"]["pricing"]["cache_write_per_million"],
-                6.25,
+                5.00,
             )
             self.assertEqual(
                 state["api_cost_estimate"]["pricing"]["long_context_cache_write_per_million"],
-                12.50,
+                10.00,
             )
             self.assertIsNone(state["api_cost_estimate"]["cache_write_cost"])
             self.assertFalse(state["api_cost_estimate"]["cache_write_cost_included"])
@@ -3747,11 +3770,11 @@ class MenuModelTests(unittest.TestCase):
         self.assertIn("Detected model: gpt-5.6-sol (logs_2.sqlite)", labels)
         self.assertIn("Pricing model: GPT-5.6-SOL; tier: Standard (assumed)", labels)
         self.assertIn(
-            "Rates /1M (short): input $5.00, cached $0.50, write $6.25, output $30.00",
+            "Rates /1M (short): input $4.00, cached $0.40, write $5.00, output $20.00",
             labels,
         )
         self.assertIn(
-            "Rates /1M (>272k input): input $10.00, cached $1.00, write $12.50, output $45.00",
+            "Rates /1M (>272k input): input $8.00, cached $0.80, write $10.00, output $30.00",
             labels,
         )
         self.assertIn(overlay.CACHE_WRITE_TELEMETRY_NOTE, labels)
@@ -3923,6 +3946,12 @@ class DisplaySelectionTests(unittest.TestCase):
 
 
 class DisplayWidgetTests(unittest.TestCase):
+    def setUp(self):
+        self.now = overlay.timestamp_to_epoch("2026-07-13T15:00:00Z")
+        clock = mock.patch.object(overlay.time, "time", return_value=self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+
     def make_app(self, snapshot, display_windows=None, show_resets=False):
         app = object.__new__(overlay.OverlayApp)
         app.settings = {
@@ -3956,6 +3985,54 @@ class DisplayWidgetTests(unittest.TestCase):
 
         self.assertEqual([(widget.key, widget.text) for widget in widgets], [("primary", "99%")])
         self.assertFalse(any("--" in widget.text for widget in widgets))
+
+    def test_cached_percentage_becomes_visibly_stale_without_new_events(self):
+        app = self.make_app(self.snapshot(
+            primary=overlay.RateWindow("7d", 10080, 77.0, 23, int(self.now + 86400)),
+        ))
+        self.assertEqual(app.display_widgets()[0].text, "23%")
+        with mock.patch.object(overlay.time, "time", return_value=self.now + 300):
+            widget = app.display_widgets()[0]
+        self.assertEqual(widget.text, "23% stale")
+        self.assertEqual(widget.color, overlay.COLOR_AMBER)
+
+    def test_new_snapshot_clears_stale_warning(self):
+        app = self.make_app(self.snapshot(
+            primary=overlay.RateWindow("7d", 10080, 77.0, 23, int(self.now + 86400)),
+        ))
+        with mock.patch.object(overlay.time, "time", return_value=self.now + 600):
+            self.assertIn("stale", app.display_widgets()[0].text)
+            app.snapshot = overlay.RateSnapshot(
+                timestamp="2026-07-13T15:10:00Z",
+                primary=overlay.RateWindow("7d", 10080, 2.0, 98, int(self.now + 604800)),
+                secondary=None, plan_type="pro", rate_limit_reached_type=None,
+            )
+            self.assertEqual(app.display_widgets()[0].text, "98%")
+
+    def test_expired_window_hides_old_percentage_even_with_recent_event(self):
+        app = self.make_app(self.snapshot(
+            primary=overlay.RateWindow("5h", 300, 77.0, 23, int(self.now)),
+            secondary=overlay.RateWindow("7d", 10080, 2.0, 98, int(self.now + 86400)),
+        ), show_resets=True)
+        widgets = app.display_widgets()
+        self.assertEqual(widgets[0].text, "5h -- reset pending")
+        self.assertTrue(widgets[1].text.startswith("7d 98% reset"))
+
+    def test_unknown_source_time_is_stale(self):
+        snapshot = overlay.RateSnapshot(
+            timestamp="unknown", primary=None, secondary=None,
+            plan_type=None, rate_limit_reached_type=None,
+        )
+        self.assertEqual(overlay.rate_data_status(snapshot), "stale")
+
+    def test_sqlite_observation_time_controls_freshness(self):
+        snapshot = overlay.RateSnapshot(
+            timestamp="unknown", primary=None, secondary=None,
+            plan_type=None, rate_limit_reached_type=None,
+            source_kind="logs_2.sqlite", source_observed_at=self.now,
+        )
+        self.assertEqual(overlay.rate_data_status(snapshot, self.now + 299), "recent")
+        self.assertEqual(overlay.rate_data_status(snapshot, self.now + 300), "stale")
 
     def test_legacy_five_hour_and_weekly_windows_render_both(self):
         snapshot = self.snapshot(

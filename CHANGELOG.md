@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.13 - 2026-09-12
+
+- Restore API-equivalent estimates for GPT-6 Astra using its published Standard
+  short- and long-context prices. Refresh Sol, Terra, and Luna prices from the
+  official pricing page, including Sol's current promotional rate.
+- Label detected models without configured prices as `API est. unpriced`.
+- Mark cached percentages stale after five minutes or when their source time
+  is unknown, including when no new events arrive.
+- Hide expired-window percentages behind `-- reset pending` until new
+  telemetry arrives; do not assume a reset means 100% remaining.
+- Expose freshness in the source menu, command-line status, and runtime
+  diagnostics. Document that Refresh only rereads local logs.
+
 ## 0.1.12 - 2026-09-03
 
 - Track the main `codex` allowance by its rate-limit identity and ignore

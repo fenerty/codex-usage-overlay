@@ -29,7 +29,7 @@ from typing import Any, Callable
 
 
 APP_NAME = "Codex Usage Overlay"
-APP_VERSION = "0.1.12"
+APP_VERSION = "0.1.13"
 SETTINGS_FILE_NAME = "codex_usage_overlay.settings.json"
 RUNTIME_STATE_FILE_NAME = "codex-usage-overlay-state.json"
 INSTANCE_LOCK_FILE_NAME = "codex-usage-overlay.lock"
@@ -49,6 +49,7 @@ WINDOWS_CODEX_PACKAGE_BUILD_RE = re.compile(
 )
 DEFAULT_OPACITY = 0.9
 POLL_INTERVAL_MS = 500
+RATE_DATA_STALE_AFTER_SECONDS = 300
 HIDDEN_POLL_INTERVAL_MS = 1_000
 HIDDEN_LOG_POLL_INTERVAL_SECONDS = 5
 PROCESS_VISIBILITY_POLL_INTERVAL_SECONDS = 1
@@ -264,35 +265,45 @@ class LogReadBatch:
     token_events: list[TokenEvent]
 
 
-# Current official OpenAI Standard API prices, per 1M text tokens.
+# Official OpenAI Standard API prices, per 1M text tokens.
+# Astra and GPT-5.6 rates verified 2026-09-12; Sol includes promotional pricing.
 # Source: https://developers.openai.com/api/docs/pricing
 API_MODEL_PRICING = {
-    "gpt-5.6-sol": ModelPricing(
-        "gpt-5.6 Sol", 5.00, 0.50, 30.00, API_PRICING_SOURCE_URL,
-        cache_write_per_million=6.25,
+    "gpt-6-astra": ModelPricing(
+        "gpt-6 Astra", 10.00, 1.00, 50.00, API_PRICING_SOURCE_URL,
+        cache_write_per_million=12.50,
         long_context_threshold_tokens=LONG_CONTEXT_INPUT_THRESHOLD_TOKENS,
-        long_context_input_per_million=10.00,
-        long_context_cached_input_per_million=1.00,
-        long_context_cache_write_per_million=12.50,
-        long_context_output_per_million=45.00,
+        long_context_input_per_million=20.00,
+        long_context_cached_input_per_million=2.00,
+        long_context_cache_write_per_million=25.00,
+        long_context_output_per_million=75.00,
+    ),
+    "gpt-5.6-sol": ModelPricing(
+        "gpt-5.6 Sol", 4.00, 0.40, 20.00, API_PRICING_SOURCE_URL,
+        cache_write_per_million=5.00,
+        long_context_threshold_tokens=LONG_CONTEXT_INPUT_THRESHOLD_TOKENS,
+        long_context_input_per_million=8.00,
+        long_context_cached_input_per_million=0.80,
+        long_context_cache_write_per_million=10.00,
+        long_context_output_per_million=30.00,
     ),
     "gpt-5.6-terra": ModelPricing(
-        "gpt-5.6 Terra", 2.50, 0.25, 15.00, API_PRICING_SOURCE_URL,
-        cache_write_per_million=3.125,
+        "gpt-5.6 Terra", 2.00, 0.20, 12.00, API_PRICING_SOURCE_URL,
+        cache_write_per_million=2.50,
         long_context_threshold_tokens=LONG_CONTEXT_INPUT_THRESHOLD_TOKENS,
-        long_context_input_per_million=5.00,
-        long_context_cached_input_per_million=0.50,
-        long_context_cache_write_per_million=6.25,
-        long_context_output_per_million=22.50,
+        long_context_input_per_million=4.00,
+        long_context_cached_input_per_million=0.40,
+        long_context_cache_write_per_million=5.00,
+        long_context_output_per_million=18.00,
     ),
     "gpt-5.6-luna": ModelPricing(
-        "gpt-5.6 Luna", 1.00, 0.10, 6.00, API_PRICING_SOURCE_URL,
-        cache_write_per_million=1.25,
+        "gpt-5.6 Luna", 0.20, 0.02, 1.20, API_PRICING_SOURCE_URL,
+        cache_write_per_million=0.25,
         long_context_threshold_tokens=LONG_CONTEXT_INPUT_THRESHOLD_TOKENS,
-        long_context_input_per_million=2.00,
-        long_context_cached_input_per_million=0.20,
-        long_context_cache_write_per_million=2.50,
-        long_context_output_per_million=9.00,
+        long_context_input_per_million=0.40,
+        long_context_cached_input_per_million=0.04,
+        long_context_cache_write_per_million=0.50,
+        long_context_output_per_million=1.80,
     ),
     "gpt-5.5": ModelPricing(
         "gpt-5.5", 5.00, 0.50, 30.00, API_PRICING_SOURCE_URL,
@@ -740,7 +751,7 @@ def format_model_name(model: str | None) -> str:
 
 def format_api_cost_estimate(estimate: ApiCostEstimate) -> str:
     if estimate.total_cost is None:
-        return "API est. --"
+        return "API est. unpriced" if estimate.model else "API est. --"
     if estimate.pricing_is_proxy:
         return f"{format_api_cost(estimate.total_cost)} API est. ({format_model_name(estimate.pricing_model)} proxy)"
     return f"{format_api_cost(estimate.total_cost)} API est."
@@ -2396,6 +2407,22 @@ def snapshot_source_age_seconds(snapshot: RateSnapshot | None, now: float | None
     return max(0, int(current - source_time))
 
 
+def rate_data_status(snapshot: RateSnapshot | None, now: float | None = None) -> str:
+    if snapshot is None:
+        return "missing"
+    age = snapshot_source_age_seconds(snapshot, now)
+    if age is None or age >= RATE_DATA_STALE_AFTER_SECONDS:
+        return "stale"
+    return "recent"
+
+
+def rate_window_status(snapshot: RateSnapshot | None, window: RateWindow, now: float | None = None) -> str:
+    current = time.time() if now is None else now
+    if window.resets_at is not None and current >= window.resets_at:
+        return "reset_pending"
+    return rate_data_status(snapshot, current)
+
+
 def runtime_state_path() -> Path:
     return Path(tempfile.gettempdir()) / RUNTIME_STATE_FILE_NAME
 
@@ -2567,6 +2594,12 @@ class RuntimeStateStore:
             "source_event_timestamp": snapshot.timestamp if snapshot else None,
             "source_observed_at": snapshot.source_observed_at if snapshot else None,
             "source_age_seconds": snapshot_source_age_seconds(snapshot, now),
+            "rate_data_status": rate_data_status(snapshot, now),
+            "rate_window_status": {
+                key: rate_window_status(snapshot, window, now)
+                for key in VALID_DISPLAY_WINDOWS
+                if snapshot is not None and (window := getattr(snapshot, key)) is not None
+            },
             "last_rate_snapshot": rate_snapshot_to_dict(snapshot),
             "token_counter": counter.state_dict(),
             "api_cost_estimate": api_cost_estimate_to_dict(api_cost_estimate),
@@ -4107,6 +4140,8 @@ class OverlayApp:
                 if rate_window.remaining_percent is None
                 else percent_color(rate_window.remaining_percent)
             )
+            if rate_window_status(self.snapshot, rate_window) != "recent":
+                color = COLOR_AMBER
             widgets.append(
                 DisplayWidget(
                     key,
@@ -4142,11 +4177,17 @@ class OverlayApp:
         show_resets: bool,
         include_window_label: bool,
     ) -> str:
+        status = rate_window_status(self.snapshot, rate_window)
+        if status == "reset_pending":
+            prefix = f"{rate_window.label} " if include_window_label else ""
+            return f"{prefix}-- reset pending"
         remaining = "--" if rate_window.remaining_percent is None else f"{rate_window.remaining_percent}%"
         if include_window_label or rate_window.remaining_percent is None:
             text = f"{rate_window.label} {remaining}"
         else:
             text = remaining
+        if status == "stale":
+            text += " stale"
         if show_resets:
             text += f" reset {format_reset_countdown(rate_window.resets_at)}"
         return text
@@ -4605,7 +4646,7 @@ class OverlayApp:
         if self.snapshot is None:
             return "Rate source: unknown"
         age = snapshot_source_age_seconds(self.snapshot)
-        return f"Rate source: {self.snapshot.source_kind}, {format_age_seconds(age)}"
+        return f"Rate source: {self.snapshot.source_kind}, {format_age_seconds(age)} ({rate_data_status(self.snapshot)})"
 
     def set_visibility_mode(self, mode: str) -> None:
         if not self.process_backend.is_supported(mode):
@@ -4732,7 +4773,12 @@ def print_status() -> int:
     for key in VALID_DISPLAY_WINDOWS:
         rate_window = snapshot.primary if key == "primary" else snapshot.secondary
         if rate_window and rate_window.remaining_percent is not None:
-            parts.append(f"{rate_window.label} {rate_window.remaining_percent}%")
+            status = rate_window_status(snapshot, rate_window)
+            if status == "reset_pending":
+                parts.append(f"{rate_window.label} -- reset pending")
+            else:
+                suffix = " stale" if status == "stale" else ""
+                parts.append(f"{rate_window.label} {rate_window.remaining_percent}%{suffix}")
     if snapshot.rate_limit_reached_type:
         parts.append("LIMIT")
     print("  ".join(parts) or "No usable Codex rate windows found.")

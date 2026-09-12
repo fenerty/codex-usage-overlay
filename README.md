@@ -21,6 +21,9 @@ This is an independent utility and is not an official OpenAI or Codex project.
 - Uses the freshest local source available: `logs_2.sqlite` rate-limit websocket
   events first, session JSONL rate events as fallback.
 - Optional reset countdowns in the overlay.
+- Readings five minutes old or of unknown age show an amber `stale` warning.
+  After a window expires, its old percentage is replaced by `-- reset pending`
+  until a new window is reported. Fresh local events clear the warning.
 - Optional manual token counter with input, cached input, output, reasoning, and
   total token details.
 - Optional API-equivalent cost estimate using local token counts and documented
@@ -146,18 +149,39 @@ paths and raw transcript content are not written.
 
 - Codex local log formats are unofficial implementation details and may change.
 - Displayed rate limits are only as fresh as the local Codex logs.
+- Percentages mean **remaining**, not used. `23% stale` is the last known
+  reading, not a live account check. The menu shows the source and its age;
+  **Refresh** rereads local files and cannot request fresh account data.
+  For a current account reading, check Codex's usage view. New local usage
+  events are normally written while Codex runs a task. Resets or activity
+  elsewhere may not appear locally until another event is written, even
+  inside the five-minute freshness threshold.
 - The rate display intentionally tracks only the main `codex` allowance. Token
   counting remains model-independent.
 - The API cost estimate is approximate and is not actual Codex subscription
   billing.
-- GPT-5.6 Sol, Terra, and Luna use their published short- and long-context
+- GPT-6 Astra and GPT-5.6 Sol, Terra, and Luna use their published short- and long-context
   Standard API prices. The unpublished GPT-5.3-Codex-Spark preview uses a clearly
   labeled GPT-5.5 proxy. Unknown, custom, and future models remain unpriced.
-- GPT-5.6 pricing publishes cache-write premiums, but local Codex events do not
+- Astra and GPT-5.6 pricing publishes cache-write premiums, but local Codex events do not
   report cache-write token counts. Those rates are exposed as metadata while
   cache-write costs are excluded from the estimate total.
 - If models change during a manual token-counter window, reset the counter for a
   cleaner cost estimate.
+
+### Pricing maintenance
+
+Astra and GPT-5.6 prices were verified against the
+[official Standard API pricing](https://developers.openai.com/api/docs/pricing)
+on September 12, 2026. Sol uses the promotional price currently published as
+available at least through November 21, 2026. Estimates apply the configured
+prices to the whole manual counter window; they are not historical invoices.
+Fast mode, regional uplifts, and tool fees are not included.
+
+New model rollouts require an explicit pricing-table update. Unsupported models
+show `API est. unpriced` rather than using a guessed price. When updating prices,
+verify input, cached input, cache write, output, and long-context rates and add
+calculation coverage before release. The overlay does not fetch prices online.
 
 ## Troubleshooting
 
