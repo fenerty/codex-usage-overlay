@@ -4152,6 +4152,37 @@ class DisplayWidgetTests(unittest.TestCase):
 
 
 class ClockRollbackReaderTests(unittest.TestCase):
+    def test_source_order_survives_clock_catchup_rescan_and_restart(self):
+        for source in ("session", "sqlite"):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory)
+                sessions = home / "sessions"
+                sessions.mkdir()
+                path = sessions / "rollout.jsonl"
+                db = home / "logs_2.sqlite"
+                row = IncrementalSqliteReaderTests().row
+                def event(timestamp, used):
+                    return token_count_line(timestamp, primary={"used_percent": used, "window_minutes": 300}) + "\n"
+                if source == "session":
+                    path.write_text(event("1970-01-01T02:46:40Z", 77), encoding="utf-8")
+                else:
+                    create_logs_db(db, [row(10_000, 77)])
+                reader = overlay.RateLogReader(home)
+                with mock.patch.object(overlay.time, "time", return_value=10_000):
+                    self.assertEqual(reader.latest_snapshot(force_rescan=True, now=0).primary.remaining_percent, 23)
+                if source == "session":
+                    with path.open("a", encoding="utf-8") as handle:
+                        handle.write(event("1970-01-01T01:46:40Z", 2))
+                else:
+                    append_logs_db(db, [row(6_400, 2)])
+                with mock.patch.object(overlay.time, "time", return_value=6_400):
+                    self.assertEqual(reader.latest_snapshot(now=10).primary.remaining_percent, 98)
+                with mock.patch.object(overlay.time, "time", return_value=10_100):
+                    for candidate in (reader, overlay.RateLogReader(home)):
+                        snapshot = candidate.latest_snapshot(force_rescan=True, now=20)
+                        self.assertEqual(snapshot.primary.remaining_percent, 98)
+                        self.assertEqual(overlay.rate_data_status(snapshot), "stale")
+
     def test_sqlite_and_combined_readers_recover_after_clock_rollback(self):
         for combined in (False, True):
             with self.subTest(combined=combined), tempfile.TemporaryDirectory() as directory:

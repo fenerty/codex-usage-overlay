@@ -17,6 +17,9 @@
   seconds ahead of the local clock as stale.
 - Allow fresh readings to replace future-dated cached snapshots after a clock
   rollback, including SQLite/session source arbitration and full rescans.
+- Preserve SQLite row and per-session append ordering when selecting readings,
+  so superseded events within a source stay superseded after clock catch-up,
+  full rescans, and restarts. Reset ordering for replaced or truncated sources.
 
 ## 0.1.12 - 2026-09-03
 

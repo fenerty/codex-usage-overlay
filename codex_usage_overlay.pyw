@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -148,6 +148,8 @@ class RateSnapshot:
     source_path: str | None = None
     source_kind: str = "session_jsonl"
     source_observed_at: float | None = None
+    source_sequence: int | None = None
+    source_generation: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -853,6 +855,25 @@ def select_rate_snapshot(
     snapshots: list[RateSnapshot], previous: RateSnapshot | None = None,
 ) -> RateSnapshot:
     candidates = snapshots + ([previous] if previous is not None else [])
+    # Within one append-only source, sequence wins permanently over wall time.
+    # Collapse before comparing sources so rescans cannot resurrect old events.
+    latest_by_source: dict[tuple[str, str], RateSnapshot] = {}
+    unsequenced: list[RateSnapshot] = []
+    for candidate in candidates:
+        if candidate.source_sequence is None or candidate.source_path is None:
+            unsequenced.append(candidate)
+            continue
+        path = candidate.source_path
+        if candidate.source_kind == "logs_2.sqlite":
+            path = path.rsplit(":", 1)[0]
+        identity = (candidate.source_kind, path)
+        existing = latest_by_source.get(identity)
+        if existing is None or (
+            candidate.source_generation == existing.source_generation
+            and candidate.source_sequence > existing.source_sequence
+        ):
+            latest_by_source[identity] = candidate
+    candidates = unsequenced + list(latest_by_source.values())
     future_cutoff = time.time() + RATE_SOURCE_FUTURE_TOLERANCE_SECONDS
 
     def selection_key(snapshot: RateSnapshot) -> tuple[bool, tuple[float, str, str]]:
@@ -878,12 +899,15 @@ def read_tail_text(path: Path, max_bytes: int = TAIL_BYTES) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def parse_rate_snapshots_from_text(text: str, source_path: str | None = None) -> list[RateSnapshot]:
+def parse_rate_snapshots_from_text(
+    text: str, source_path: str | None = None, source_offset: int = 0,
+) -> list[RateSnapshot]:
     snapshots: list[RateSnapshot] = []
-    for line in text.splitlines():
+    for line in text.splitlines(keepends=True):
+        source_offset += len(line.encode("utf-8"))
         snapshot = parse_rate_line(line, source_path)
         if snapshot is not None:
-            snapshots.append(snapshot)
+            snapshots.append(replace(snapshot, source_sequence=source_offset))
     return snapshots
 
 
@@ -985,6 +1009,7 @@ class SqliteRateLimitReader:
         self._database_signature: tuple[tuple[int, int, int, str] | None, ...] | None = None
         self._last_probe_at = 0.0
         self._retry_required = False
+        self._source_generation = 0
 
     @staticmethod
     def _path_signature(path: Path) -> tuple[int, int, int, str] | None:
@@ -1066,6 +1091,7 @@ class SqliteRateLimitReader:
             row_id_rolled_back = (
                 self._last_row_id is not None and max_row_id < self._last_row_id
             )
+            source_generation = self._source_generation + int(database_replaced or row_id_rolled_back)
             full_rescan = (
                 force_rescan
                 or self._last_row_id is None
@@ -1110,7 +1136,8 @@ class SqliteRateLimitReader:
                     source_path = f"{self.path}:{row_id}"
                     snapshot = parse_sqlite_rate_limit_log_body(body, observed_float, source_path)
                     if snapshot is not None:
-                        snapshots.append(snapshot)
+                        snapshots.append(replace(snapshot, source_sequence=row_id,
+                                                 source_generation=(source_generation,)))
                 if snapshots or len(rows) < page_size:
                     break
                 before_row_id = min(row[0] for row in rows)
@@ -1118,6 +1145,7 @@ class SqliteRateLimitReader:
                 self._last_snapshot = select_rate_snapshot(snapshots, self._last_snapshot)
 
             self._last_row_id = max_row_id
+            self._source_generation = source_generation
             self._database_identity = database_identity
             self._database_signature = database_signature
             self._last_probe_at = (
@@ -1141,6 +1169,7 @@ class RateLogReader:
         self._session_files: list[tuple[Path, os.stat_result]] = []
         self._offsets: dict[Path, int] = {}
         self._partials: dict[Path, str] = {}
+        self._source_generations: dict[Path, int] = {}
         self._last_snapshot: RateSnapshot | None = None
         self._last_full_session_scan_at: float | None = None
         self.last_error: str | None = None
@@ -1163,8 +1192,14 @@ class RateLogReader:
             snapshots: list[RateSnapshot] = []
             token_events: list[TokenEvent] = []
             for path, stat_result in active_files:
+                if stat_result.st_size < self._offsets.get(path, 0):
+                    self._source_generations[path] = self._source_generations.get(path, 0) + 1
                 text = self._read_file_updates(path, stat_result, force_tail=force_rescan)
-                snapshots.extend(parse_rate_snapshots_from_text(text, str(path)))
+                complete_end = self._offsets.get(path, 0) - len(self._partials.get(path, "").encode("utf-8"))
+                source_offset = complete_end - len(text.encode("utf-8"))
+                generation = (stat_result.st_dev, stat_result.st_ino, self._source_generations.get(path, 0))
+                snapshots.extend(replace(snapshot, source_generation=generation)
+                                 for snapshot in parse_rate_snapshots_from_text(text, str(path), source_offset))
                 token_events.extend(parse_token_events_from_text(text, str(path)))
 
             sqlite_snapshot = self.sqlite_reader.latest_snapshot(
