@@ -22,6 +22,9 @@
   full rescans, and restarts. Reset ordering for replaced or truncated sources.
 - Persist hashes of superseded future readings across sources, preventing old
   SQLite or session readings from reviving after clock catch-up or restart.
+- Record supersession even for stale replacement readings; invalidate byte
+  ordering when a pruned session returns. Serialize history writers with an OS
+  lock, merge their records, and publish through unique temporary files.
 
 ## 0.1.12 - 2026-09-03
 

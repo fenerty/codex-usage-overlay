@@ -1170,6 +1170,16 @@ class SqliteRateLimitReader:
                 connection.close()
 
 
+def read_supersession_history(path: Path) -> set[str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return set()
+    if not isinstance(data, list) or any(not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{64}", key) for key in data):
+        raise ValueError("invalid supersession record")
+    return set(data)
+
+
 class RateLogReader:
     def __init__(self, codex_home: Path | None = None, supersession_path: Path | None = None) -> None:
         self.codex_home = codex_home or resolve_codex_home()
@@ -1189,12 +1199,7 @@ class RateLogReader:
         self._supersession_dirty = False
         self._supersession_error: str | None = None
         try:
-            data = json.loads(self._supersession_path.read_text(encoding="utf-8"))
-            if not isinstance(data, list) or any(not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{64}", key) for key in data):
-                raise ValueError("invalid supersession record")
-            self._superseded = set(data)
-        except FileNotFoundError:
-            pass
+            self._superseded = read_supersession_history(self._supersession_path)
         except (OSError, ValueError) as exc:
             self._supersession_error = f"Supersession history unavailable: {type(exc).__name__}"
 
@@ -1203,7 +1208,7 @@ class RateLogReader:
         candidates = [candidate for candidate in candidates
                       if snapshot_fingerprint(candidate) not in self._superseded]
         newest = select_rate_snapshot(candidates) if candidates else None
-        if newest is not None and rate_data_status(newest) == "recent":
+        if newest is not None and snapshot_source_age_seconds(newest) is not None:
             for candidate in candidates:
                 if snapshot_is_future(candidate):
                     self._superseded.add(snapshot_fingerprint(candidate))
@@ -1213,14 +1218,38 @@ class RateLogReader:
     def _save_supersession(self) -> None:
         if not self._supersession_dirty:
             return
+        temporary: Path | None = None
         try:
-            temporary = self._supersession_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(sorted(self._superseded)), encoding="utf-8")
-            temporary.replace(self._supersession_path)
+            # A nonblocking OS lock is released even if the process exits.
+            # Contention leaves the dirty flag set for the next polling cycle.
+            with self._supersession_path.with_suffix(".lock").open("a+b") as lock:
+                if os.name == "nt":
+                    import msvcrt
+                    if lock.seek(0, os.SEEK_END) == 0:
+                        lock.write(b"\0")
+                        lock.flush()
+                    lock.seek(0)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self._superseded.update(read_supersession_history(self._supersession_path))
+                descriptor, name = tempfile.mkstemp(prefix=self._supersession_path.stem + "-", suffix=".tmp",
+                                                     dir=self._supersession_path.parent)
+                temporary = Path(name)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    json.dump(sorted(self._superseded), handle)
+                temporary.replace(self._supersession_path)
             self._supersession_dirty = False
             self._supersession_error = None
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             self._supersession_error = f"Supersession history not saved: {type(exc).__name__}"
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def read_updates(
         self,
@@ -1383,6 +1412,9 @@ class RateLogReader:
     def _prune_tracking(self, active_paths: set[Path]) -> None:
         for tracked in list(self._offsets):
             if tracked not in active_paths:
+                # Its next read has no byte checkpoint; never compare that new
+                # scan against cached positions from the discarded generation.
+                self._source_generations[tracked] = self._source_generations.get(tracked, 0) + 1
                 self._offsets.pop(tracked, None)
                 self._partials.pop(tracked, None)
 

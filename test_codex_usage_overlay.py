@@ -5,6 +5,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -4153,8 +4154,8 @@ class DisplayWidgetTests(unittest.TestCase):
 
 class ClockRollbackReaderTests(unittest.TestCase):
     def test_cross_source_supersession_survives_catchup_and_restart(self):
-        for old_source in ("session", "sqlite"):
-            with self.subTest(old_source=old_source), tempfile.TemporaryDirectory() as directory:
+        for old_source, first_read_at in ((source, timestamp) for source in ("session", "sqlite") for timestamp in (6_400, 7_000)):
+            with self.subTest(old_source=old_source, first_read_at=first_read_at), tempfile.TemporaryDirectory() as directory:
                 home = Path(directory)
                 sessions = home / "sessions"
                 sessions.mkdir()
@@ -4174,7 +4175,7 @@ class ClockRollbackReaderTests(unittest.TestCase):
                 with mock.patch.object(overlay.time, "time", return_value=10_000):
                     self.assertEqual(reader.latest_snapshot(force_rescan=True, now=0).primary.remaining_percent, 23)
                 append("sqlite" if old_source == "session" else "session", 6_400, 2)
-                with mock.patch.object(overlay.time, "time", return_value=6_400):
+                with mock.patch.object(overlay.time, "time", return_value=first_read_at):
                     self.assertEqual(reader.latest_snapshot(now=40).primary.remaining_percent, 98)
                 saved = json.loads(history.read_text())
                 self.assertTrue(saved)
@@ -4201,6 +4202,56 @@ class ClockRollbackReaderTests(unittest.TestCase):
             self.assertFalse(reader._supersession_dirty)
             self.assertIsNone(reader._supersession_error)
             self.assertEqual(overlay.RateLogReader(home, supersession_path=history)._superseded, {"a" * 64})
+
+    def test_concurrent_history_writers_retry_and_merge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            history = home / "supersession.json"
+            first = overlay.RateLogReader(home, supersession_path=history)
+            second = overlay.RateLogReader(home, supersession_path=history)
+            first._superseded = {"a" * 64}
+            second._superseded = {"b" * 64}
+            first._supersession_dirty = second._supersession_dirty = True
+            locked = threading.Event()
+            release = threading.Event()
+            original = overlay.tempfile.mkstemp
+            def pause_with_lock(**kwargs):
+                locked.set()
+                if not release.wait(5):
+                    raise OSError("test lock timeout")
+                return original(**kwargs)
+            with mock.patch.object(overlay.tempfile, "mkstemp", side_effect=pause_with_lock):
+                writer = threading.Thread(target=first._save_supersession)
+                writer.start()
+                try:
+                    self.assertTrue(locked.wait(5))
+                    second._save_supersession()
+                    self.assertTrue(second._supersession_dirty)
+                finally:
+                    release.set()
+                    writer.join(5)
+            self.assertFalse(writer.is_alive())
+            self.assertFalse(first._supersession_dirty)
+            second._save_supersession()
+            self.assertFalse(second._supersession_dirty)
+            self.assertEqual(overlay.read_supersession_history(history), {"a" * 64, "b" * 64})
+            self.assertEqual(list(home.glob("*.tmp")), [])
+
+    def test_pruned_session_truncated_in_place_gets_new_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            sessions = home / "sessions"
+            sessions.mkdir()
+            path = sessions / "rollout.jsonl"
+            old = token_count_line("2026-09-12T10:00:00Z", primary={"used_percent": 77, "window_minutes": 300}) + "\n"
+            new = token_count_line("2026-09-12T10:01:00Z", primary={"used_percent": 2, "window_minutes": 300}) + "\n"
+            path.write_text(old * 2, encoding="utf-8")
+            reader = overlay.RateLogReader(home, supersession_path=home / "supersession.json")
+            self.assertEqual(reader.latest_snapshot(force_rescan=True, now=0).primary.remaining_percent, 23)
+            reader._prune_tracking(set())
+            self.assertNotIn(path, reader._offsets)
+            path.write_text(new, encoding="utf-8")
+            self.assertEqual(reader.latest_snapshot(force_rescan=True, now=40).primary.remaining_percent, 98)
 
     def test_source_order_survives_clock_catchup_rescan_and_restart(self):
         for source in ("session", "sqlite"):

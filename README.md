@@ -151,6 +151,9 @@ readings, is scoped to the Codex home directory, and survives overlay restarts.
 Deleting this file clears cross-source rollback history. If it cannot be saved,
 the overlay retains in-memory protection, reports a reader error in Details,
 and retries saving on subsequent polls.
+Writers use a companion `.lock` file and merge existing hashes while holding an
+OS lock, so concurrent overlay and `--print-status` processes preserve each
+other's history. The OS releases the lock if a process exits.
 
 ## Limitations
 
