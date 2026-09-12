@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -4025,6 +4026,49 @@ class DisplayWidgetTests(unittest.TestCase):
         )
         self.assertEqual(overlay.rate_data_status(snapshot), "stale")
 
+    def test_future_timestamp_and_backward_clock_are_not_recent(self):
+        snapshot = self.snapshot(primary=overlay.RateWindow("7d", 10080, 77, 23, int(self.now + 86400)))
+        for kind in ("session_jsonl", "logs_2.sqlite"):
+            candidate = replace(snapshot, source_kind=kind,
+                                source_observed_at=self.now if kind == "logs_2.sqlite" else None)
+            with self.subTest(kind=kind):
+                self.assertEqual(overlay.rate_data_status(candidate, self.now), "recent")
+                self.assertEqual(overlay.rate_data_status(candidate, self.now - 3600), "stale")
+                self.assertEqual(overlay.rate_data_status(candidate, self.now - 600), "stale")
+
+    def test_limit_flag_is_active_only_for_recent_unexpired_windows(self):
+        snapshot = replace(self.snapshot(
+            primary=overlay.RateWindow("7d", 10080, 100, 0, int(self.now + 600)),
+        ), rate_limit_reached_type="primary")
+        app = self.make_app(snapshot)
+        for elapsed, expected in ((0, "0% LIMIT"), (300, "0% stale"), (600, "-- reset pending")):
+            with self.subTest(elapsed=elapsed), mock.patch.object(overlay.time, "time", return_value=self.now + elapsed):
+                widget = app.display_widgets()[0]
+                self.assertEqual(widget.text, expected)
+                self.assertEqual(widget.color, overlay.COLOR_RED if elapsed == 0 else overlay.COLOR_AMBER)
+                with mock.patch.object(overlay.RateLogReader, "latest_snapshot", return_value=snapshot), mock.patch("builtins.print") as output:
+                    self.assertEqual(overlay.print_status(), 0)
+                    text = output.call_args.args[0]
+                self.assertEqual("LIMIT" in text, elapsed == 0)
+
+    def test_expired_window_suppresses_snapshot_wide_limit_flag(self):
+        snapshot = replace(self.snapshot(
+            primary=overlay.RateWindow("5h", 300, 100, 0, int(self.now)),
+            secondary=overlay.RateWindow("7d", 10080, 50, 50, int(self.now + 86400)),
+        ), rate_limit_reached_type="primary")
+        self.assertFalse(overlay.snapshot_has_active_limit(snapshot))
+
+    def test_details_mask_expired_values_and_mark_stale_values(self):
+        app = MenuModelTests().make_app()
+        app.snapshot = self.snapshot(primary=overlay.RateWindow("7d", 10080, 77, 23, int(self.now + 600)))
+        for elapsed, expected in ((0, "23% remaining"), (300, "23% remaining stale"), (600, "-- reset pending")):
+            with self.subTest(elapsed=elapsed), mock.patch.object(overlay.time, "time", return_value=self.now + elapsed):
+                rows = app.build_detail_menu_rows()
+                label = next(row.label for row in rows if row.label and row.label.startswith("7d:"))
+                self.assertIn(expected, label)
+                if elapsed == 600:
+                    self.assertNotIn("23%", label)
+
     def test_sqlite_observation_time_controls_freshness(self):
         snapshot = overlay.RateSnapshot(
             timestamp="unknown", primary=None, secondary=None,
@@ -4067,6 +4111,7 @@ class DisplayWidgetTests(unittest.TestCase):
         )
 
         with mock.patch.object(overlay.time, "time", return_value=1_000):
+            snapshot = replace(snapshot, timestamp="1970-01-01T00:16:40Z")
             widgets = overlay.OverlayApp.display_widgets(
                 self.make_app(snapshot, show_resets=True)
             )

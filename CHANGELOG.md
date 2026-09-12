@@ -12,6 +12,9 @@
   telemetry arrives; do not assume a reset means 100% remaining.
 - Expose freshness in the source menu, command-line status, and runtime
   diagnostics. Document that Refresh only rereads local logs.
+- Suppress cached LIMIT flags once readings are stale or a window expires,
+  mask expired percentages in Details, and treat source times more than five
+  seconds ahead of the local clock as stale.
 
 ## 0.1.12 - 2026-09-03
 

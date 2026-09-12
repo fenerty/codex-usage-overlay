@@ -50,6 +50,7 @@ WINDOWS_CODEX_PACKAGE_BUILD_RE = re.compile(
 DEFAULT_OPACITY = 0.9
 POLL_INTERVAL_MS = 500
 RATE_DATA_STALE_AFTER_SECONDS = 300
+RATE_SOURCE_FUTURE_TOLERANCE_SECONDS = 5
 HIDDEN_POLL_INTERVAL_MS = 1_000
 HIDDEN_LOG_POLL_INTERVAL_SECONDS = 5
 PROCESS_VISIBILITY_POLL_INTERVAL_SECONDS = 1
@@ -2404,6 +2405,9 @@ def snapshot_source_age_seconds(snapshot: RateSnapshot | None, now: float | None
     if source_time is None:
         return None
     current = time.time() if now is None else now
+    if source_time > current + RATE_SOURCE_FUTURE_TOLERANCE_SECONDS:
+        # Clock corrections and future-dated logs must not extend freshness.
+        return None
     return max(0, int(current - source_time))
 
 
@@ -2421,6 +2425,14 @@ def rate_window_status(snapshot: RateSnapshot | None, window: RateWindow, now: f
     if window.resets_at is not None and current >= window.resets_at:
         return "reset_pending"
     return rate_data_status(snapshot, current)
+
+
+def snapshot_has_active_limit(snapshot: RateSnapshot | None) -> bool:
+    if snapshot is None or not snapshot.rate_limit_reached_type:
+        return False
+    windows = [getattr(snapshot, key) for key in available_rate_window_keys(snapshot)]
+    # The flag is snapshot-wide; do not guess which window caused it.
+    return bool(windows) and all(rate_window_status(snapshot, window) == "recent" for window in windows)
 
 
 def runtime_state_path() -> Path:
@@ -4154,7 +4166,7 @@ class OverlayApp:
                 )
             )
 
-        if self.snapshot and self.snapshot.rate_limit_reached_type:
+        if snapshot_has_active_limit(self.snapshot):
             if widgets:
                 first = widgets[0]
                 widgets[0] = DisplayWidget(first.key, f"{first.text} LIMIT", COLOR_RED)
@@ -4546,6 +4558,11 @@ class OverlayApp:
                         if rate_window.remaining_percent is None
                         else f"{rate_window.remaining_percent}% remaining"
                     )
+                    status = rate_window_status(self.snapshot, rate_window)
+                    if status == "reset_pending":
+                        value = "-- reset pending"
+                    elif status == "stale":
+                        value += " stale"
                     rows.append(
                         MenuRow.disabled(
                             f"{rate_window.label}: {value}, resets {format_reset_time(rate_window.resets_at)}"
@@ -4779,7 +4796,7 @@ def print_status() -> int:
             else:
                 suffix = " stale" if status == "stale" else ""
                 parts.append(f"{rate_window.label} {rate_window.remaining_percent}%{suffix}")
-    if snapshot.rate_limit_reached_type:
+    if snapshot_has_active_limit(snapshot):
         parts.append("LIMIT")
     print("  ".join(parts) or "No usable Codex rate windows found.")
     return 0
