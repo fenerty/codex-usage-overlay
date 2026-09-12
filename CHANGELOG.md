@@ -20,6 +20,8 @@
 - Preserve SQLite row and per-session append ordering when selecting readings,
   so superseded events within a source stay superseded after clock catch-up,
   full rescans, and restarts. Reset ordering for replaced or truncated sources.
+- Persist hashes of superseded future readings across sources, preventing old
+  SQLite or session readings from reviving after clock catch-up or restart.
 
 ## 0.1.12 - 2026-09-03
 

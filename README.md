@@ -145,6 +145,13 @@ normal quit. Its additive diagnostics contain only overlay/menu/drag state, sani
 error text, visibility mode, and the detected packaged desktop build; executable
 paths and raw transcript content are not written.
 
+Rollback recovery also stores a `codex-usage-supersession-<hash>.json` file in
+the user temp directory. It contains only SHA-256 identifiers of superseded
+readings, is scoped to the Codex home directory, and survives overlay restarts.
+Deleting this file clears cross-source rollback history. If it cannot be saved,
+the overlay retains in-memory protection, reports a reader error in Details,
+and retries saving on subsequent polls.
+
 ## Limitations
 
 - Codex local log formats are unofficial implementation details and may change.

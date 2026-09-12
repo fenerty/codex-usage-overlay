@@ -851,6 +851,18 @@ def timestamp_sort_key(snapshot: RateSnapshot) -> tuple[float, str, str]:
     return (parsed_timestamp, source_priority, snapshot.source_path or "")
 
 
+def snapshot_is_future(snapshot: RateSnapshot) -> bool:
+    cutoff = time.time() + RATE_SOURCE_FUTURE_TOLERANCE_SECONDS
+    times = (timestamp_to_epoch(snapshot.timestamp), snapshot.source_observed_at)
+    return any(value is not None and value > cutoff for value in times)
+
+
+def snapshot_fingerprint(snapshot: RateSnapshot) -> str:
+    identity = rate_snapshot_to_dict(snapshot)
+    identity["source_sequence"] = snapshot.source_sequence
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 def select_rate_snapshot(
     snapshots: list[RateSnapshot], previous: RateSnapshot | None = None,
 ) -> RateSnapshot:
@@ -874,14 +886,10 @@ def select_rate_snapshot(
         ):
             latest_by_source[identity] = candidate
     candidates = unsequenced + list(latest_by_source.values())
-    future_cutoff = time.time() + RATE_SOURCE_FUTURE_TOLERANCE_SECONDS
-
     def selection_key(snapshot: RateSnapshot) -> tuple[bool, tuple[float, str, str]]:
-        source_times = (timestamp_to_epoch(snapshot.timestamp), snapshot.source_observed_at)
-        future = any(value is not None and value > future_cutoff for value in source_times)
         # A rollback must not let a cached future timestamp outrank fresh data.
         # Apply this to the whole batch too, including rescanned historical rows.
-        return (not future, timestamp_sort_key(snapshot))
+        return (not snapshot_is_future(snapshot), timestamp_sort_key(snapshot))
 
     return max(candidates, key=selection_key)
 
@@ -1163,7 +1171,7 @@ class SqliteRateLimitReader:
 
 
 class RateLogReader:
-    def __init__(self, codex_home: Path | None = None) -> None:
+    def __init__(self, codex_home: Path | None = None, supersession_path: Path | None = None) -> None:
         self.codex_home = codex_home or resolve_codex_home()
         self.sqlite_reader = SqliteRateLimitReader(self.codex_home / "logs_2.sqlite")
         self._session_files: list[tuple[Path, os.stat_result]] = []
@@ -1173,6 +1181,46 @@ class RateLogReader:
         self._last_snapshot: RateSnapshot | None = None
         self._last_full_session_scan_at: float | None = None
         self.last_error: str | None = None
+        home_key = hashlib.sha256(str(self.codex_home.resolve()).encode("utf-8")).hexdigest()[:24]
+        self._supersession_path = supersession_path or (
+            Path(tempfile.gettempdir()) / f"codex-usage-supersession-{home_key}.json"
+        )
+        self._superseded: set[str] = set()
+        self._supersession_dirty = False
+        self._supersession_error: str | None = None
+        try:
+            data = json.loads(self._supersession_path.read_text(encoding="utf-8"))
+            if not isinstance(data, list) or any(not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{64}", key) for key in data):
+                raise ValueError("invalid supersession record")
+            self._superseded = set(data)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            self._supersession_error = f"Supersession history unavailable: {type(exc).__name__}"
+
+    def _select_snapshot(self, snapshots: list[RateSnapshot]) -> None:
+        candidates = snapshots + ([self._last_snapshot] if self._last_snapshot else [])
+        candidates = [candidate for candidate in candidates
+                      if snapshot_fingerprint(candidate) not in self._superseded]
+        newest = select_rate_snapshot(candidates) if candidates else None
+        if newest is not None and rate_data_status(newest) == "recent":
+            for candidate in candidates:
+                if snapshot_is_future(candidate):
+                    self._superseded.add(snapshot_fingerprint(candidate))
+                    self._supersession_dirty = True
+        self._last_snapshot = newest
+
+    def _save_supersession(self) -> None:
+        if not self._supersession_dirty:
+            return
+        try:
+            temporary = self._supersession_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(sorted(self._superseded)), encoding="utf-8")
+            temporary.replace(self._supersession_path)
+            self._supersession_dirty = False
+            self._supersession_error = None
+        except OSError as exc:
+            self._supersession_error = f"Supersession history not saved: {type(exc).__name__}"
 
     def read_updates(
         self,
@@ -1210,7 +1258,9 @@ class RateLogReader:
                 snapshots.append(sqlite_snapshot)
 
             if snapshots:
-                self._last_snapshot = select_rate_snapshot(snapshots, self._last_snapshot)
+                self._select_snapshot(snapshots)
+            self._save_supersession()
+            self.last_error = self.last_error or self._supersession_error
             return LogReadBatch(snapshot=self._last_snapshot, token_events=token_events)
         except Exception as exc:  # Defensive: never let a log race crash the overlay.
             self.last_error = str(exc)

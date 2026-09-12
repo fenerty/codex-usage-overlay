@@ -4152,6 +4152,56 @@ class DisplayWidgetTests(unittest.TestCase):
 
 
 class ClockRollbackReaderTests(unittest.TestCase):
+    def test_cross_source_supersession_survives_catchup_and_restart(self):
+        for old_source in ("session", "sqlite"):
+            with self.subTest(old_source=old_source), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory)
+                sessions = home / "sessions"
+                sessions.mkdir()
+                path = sessions / "rollout.jsonl"
+                db = home / "logs_2.sqlite"
+                history = home / "supersession.json"
+                create_logs_db(db, [])
+                def append(source, epoch, used):
+                    if source == "sqlite":
+                        append_logs_db(db, [IncrementalSqliteReaderTests().row(epoch, used)])
+                    else:
+                        with path.open("a", encoding="utf-8") as handle:
+                            handle.write(token_count_line(overlay.timestamp_from_epoch(epoch),
+                                primary={"used_percent": used, "window_minutes": 300}) + "\n")
+                append(old_source, 10_000, 77)
+                reader = overlay.RateLogReader(home, supersession_path=history)
+                with mock.patch.object(overlay.time, "time", return_value=10_000):
+                    self.assertEqual(reader.latest_snapshot(force_rescan=True, now=0).primary.remaining_percent, 23)
+                append("sqlite" if old_source == "session" else "session", 6_400, 2)
+                with mock.patch.object(overlay.time, "time", return_value=6_400):
+                    self.assertEqual(reader.latest_snapshot(now=40).primary.remaining_percent, 98)
+                saved = json.loads(history.read_text())
+                self.assertTrue(saved)
+                self.assertTrue(all(len(key) == 64 for key in saved))
+                with mock.patch.object(overlay.time, "time", return_value=10_100):
+                    restarted = overlay.RateLogReader(home, supersession_path=history)
+                    for candidate in (reader, restarted):
+                        self.assertEqual(candidate.latest_snapshot(force_rescan=True, now=50).primary.remaining_percent, 98)
+                    append(old_source, 10_100, 40)
+                    self.assertEqual(restarted.latest_snapshot(now=60).primary.remaining_percent, 60)
+
+    def test_supersession_save_failure_retries_without_losing_memory_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            history = home / "missing" / "supersession.json"
+            reader = overlay.RateLogReader(home, supersession_path=history)
+            reader._superseded.add("a" * 64)
+            reader._supersession_dirty = True
+            reader._save_supersession()
+            self.assertTrue(reader._supersession_dirty)
+            self.assertIsNotNone(reader._supersession_error)
+            history.parent.mkdir()
+            reader._save_supersession()
+            self.assertFalse(reader._supersession_dirty)
+            self.assertIsNone(reader._supersession_error)
+            self.assertEqual(overlay.RateLogReader(home, supersession_path=history)._superseded, {"a" * 64})
+
     def test_source_order_survives_clock_catchup_rescan_and_restart(self):
         for source in ("session", "sqlite"):
             with self.subTest(source=source), tempfile.TemporaryDirectory() as directory:
