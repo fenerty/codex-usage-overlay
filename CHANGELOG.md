@@ -13,18 +13,10 @@
 - Expose freshness in the source menu, command-line status, and runtime
   diagnostics. Document that Refresh only rereads local logs.
 - Suppress cached LIMIT flags once readings are stale or a window expires,
-  mask expired percentages in Details, and treat source times more than five
-  seconds ahead of the local clock as stale.
-- Allow fresh readings to replace future-dated cached snapshots after a clock
-  rollback, including SQLite/session source arbitration and full rescans.
-- Preserve SQLite row and per-session append ordering when selecting readings,
-  so superseded events within a source stay superseded after clock catch-up,
-  full rescans, and restarts. Reset ordering for replaced or truncated sources.
-- Persist hashes of superseded future readings across sources, preventing old
-  SQLite or session readings from reviving after clock catch-up or restart.
-- Record supersession even for stale replacement readings; invalidate byte
-  ordering when a pruned session returns. Serialize history writers with an OS
-  lock, merge their records, and publish through unique temporary files.
+  and mask expired percentages in Details.
+- When selected telemetry is future-dated, hide percentages behind a clock
+  mismatch warning for the reader lifetime. Automatic recovery across clock
+  changes is explicitly out of scope; no supersession history is persisted.
 
 ## 0.1.12 - 2026-09-03
 

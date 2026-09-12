@@ -145,16 +145,6 @@ normal quit. Its additive diagnostics contain only overlay/menu/drag state, sani
 error text, visibility mode, and the detected packaged desktop build; executable
 paths and raw transcript content are not written.
 
-Rollback recovery also stores a `codex-usage-supersession-<hash>.json` file in
-the user temp directory. It contains only SHA-256 identifiers of superseded
-readings, is scoped to the Codex home directory, and survives overlay restarts.
-Deleting this file clears cross-source rollback history. If it cannot be saved,
-the overlay retains in-memory protection, reports a reader error in Details,
-and retries saving on subsequent polls.
-Writers use a companion `.lock` file and merge existing hashes while holding an
-OS lock, so concurrent overlay and `--print-status` processes preserve each
-other's history. The OS releases the lock if a process exits.
-
 ## Limitations
 
 - Codex local log formats are unofficial implementation details and may change.
@@ -252,3 +242,18 @@ python -m py_compile codex_usage_overlay.pyw test_codex_usage_overlay.py
 ```
 
 The project intentionally uses only the Python standard library.
+
+### Clock changes
+
+If a selected usage event is more than five seconds ahead of the system clock,
+the overlay shows `Usage unavailable - clock mismatch` instead of percentages.
+That warning stays active for the lifetime of the reader, including Refresh;
+clock catch-up alone does not make its cached reading trustworthy again.
+Check usage directly in Codex while the warning is present. After correcting
+the clock, run a new Codex task and restart the overlay to begin a new reader.
+
+Automatic reconstruction of event order across clock changes, separate logs,
+and restarts is outside this utility's scope. Source timestamps are assumed
+consistent at startup; undetectable historical clock changes cannot be inferred.
+No rollback-history files are read or written. Hash/lock files from earlier
+PR builds are inert and may be removed manually.

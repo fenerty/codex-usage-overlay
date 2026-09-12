@@ -148,8 +148,7 @@ class RateSnapshot:
     source_path: str | None = None
     source_kind: str = "session_jsonl"
     source_observed_at: float | None = None
-    source_sequence: int | None = None
-    source_generation: tuple[int, ...] | None = None
+    clock_mismatch: bool = False
 
 
 @dataclass(frozen=True)
@@ -851,49 +850,6 @@ def timestamp_sort_key(snapshot: RateSnapshot) -> tuple[float, str, str]:
     return (parsed_timestamp, source_priority, snapshot.source_path or "")
 
 
-def snapshot_is_future(snapshot: RateSnapshot) -> bool:
-    cutoff = time.time() + RATE_SOURCE_FUTURE_TOLERANCE_SECONDS
-    times = (timestamp_to_epoch(snapshot.timestamp), snapshot.source_observed_at)
-    return any(value is not None and value > cutoff for value in times)
-
-
-def snapshot_fingerprint(snapshot: RateSnapshot) -> str:
-    identity = rate_snapshot_to_dict(snapshot)
-    identity["source_sequence"] = snapshot.source_sequence
-    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
-
-
-def select_rate_snapshot(
-    snapshots: list[RateSnapshot], previous: RateSnapshot | None = None,
-) -> RateSnapshot:
-    candidates = snapshots + ([previous] if previous is not None else [])
-    # Within one append-only source, sequence wins permanently over wall time.
-    # Collapse before comparing sources so rescans cannot resurrect old events.
-    latest_by_source: dict[tuple[str, str], RateSnapshot] = {}
-    unsequenced: list[RateSnapshot] = []
-    for candidate in candidates:
-        if candidate.source_sequence is None or candidate.source_path is None:
-            unsequenced.append(candidate)
-            continue
-        path = candidate.source_path
-        if candidate.source_kind == "logs_2.sqlite":
-            path = path.rsplit(":", 1)[0]
-        identity = (candidate.source_kind, path)
-        existing = latest_by_source.get(identity)
-        if existing is None or (
-            candidate.source_generation == existing.source_generation
-            and candidate.source_sequence > existing.source_sequence
-        ):
-            latest_by_source[identity] = candidate
-    candidates = unsequenced + list(latest_by_source.values())
-    def selection_key(snapshot: RateSnapshot) -> tuple[bool, tuple[float, str, str]]:
-        # A rollback must not let a cached future timestamp outrank fresh data.
-        # Apply this to the whole batch too, including rescanned historical rows.
-        return (not snapshot_is_future(snapshot), timestamp_sort_key(snapshot))
-
-    return max(candidates, key=selection_key)
-
-
 def read_tail_text(path: Path, max_bytes: int = TAIL_BYTES) -> str:
     try:
         size = path.stat().st_size
@@ -907,15 +863,12 @@ def read_tail_text(path: Path, max_bytes: int = TAIL_BYTES) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def parse_rate_snapshots_from_text(
-    text: str, source_path: str | None = None, source_offset: int = 0,
-) -> list[RateSnapshot]:
+def parse_rate_snapshots_from_text(text: str, source_path: str | None = None) -> list[RateSnapshot]:
     snapshots: list[RateSnapshot] = []
-    for line in text.splitlines(keepends=True):
-        source_offset += len(line.encode("utf-8"))
+    for line in text.splitlines():
         snapshot = parse_rate_line(line, source_path)
         if snapshot is not None:
-            snapshots.append(replace(snapshot, source_sequence=source_offset))
+            snapshots.append(snapshot)
     return snapshots
 
 
@@ -1017,7 +970,6 @@ class SqliteRateLimitReader:
         self._database_signature: tuple[tuple[int, int, int, str] | None, ...] | None = None
         self._last_probe_at = 0.0
         self._retry_required = False
-        self._source_generation = 0
 
     @staticmethod
     def _path_signature(path: Path) -> tuple[int, int, int, str] | None:
@@ -1099,7 +1051,6 @@ class SqliteRateLimitReader:
             row_id_rolled_back = (
                 self._last_row_id is not None and max_row_id < self._last_row_id
             )
-            source_generation = self._source_generation + int(database_replaced or row_id_rolled_back)
             full_rescan = (
                 force_rescan
                 or self._last_row_id is None
@@ -1144,16 +1095,19 @@ class SqliteRateLimitReader:
                     source_path = f"{self.path}:{row_id}"
                     snapshot = parse_sqlite_rate_limit_log_body(body, observed_float, source_path)
                     if snapshot is not None:
-                        snapshots.append(replace(snapshot, source_sequence=row_id,
-                                                 source_generation=(source_generation,)))
+                        snapshots.append(snapshot)
                 if snapshots or len(rows) < page_size:
                     break
                 before_row_id = min(row[0] for row in rows)
             if snapshots:
-                self._last_snapshot = select_rate_snapshot(snapshots, self._last_snapshot)
+                newest = max(snapshots, key=timestamp_sort_key)
+                if (
+                    self._last_snapshot is None
+                    or timestamp_sort_key(newest) >= timestamp_sort_key(self._last_snapshot)
+                ):
+                    self._last_snapshot = newest
 
             self._last_row_id = max_row_id
-            self._source_generation = source_generation
             self._database_identity = database_identity
             self._database_signature = database_signature
             self._last_probe_at = (
@@ -1170,86 +1124,17 @@ class SqliteRateLimitReader:
                 connection.close()
 
 
-def read_supersession_history(path: Path) -> set[str]:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return set()
-    if not isinstance(data, list) or any(not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{64}", key) for key in data):
-        raise ValueError("invalid supersession record")
-    return set(data)
-
-
 class RateLogReader:
-    def __init__(self, codex_home: Path | None = None, supersession_path: Path | None = None) -> None:
+    def __init__(self, codex_home: Path | None = None) -> None:
         self.codex_home = codex_home or resolve_codex_home()
         self.sqlite_reader = SqliteRateLimitReader(self.codex_home / "logs_2.sqlite")
         self._session_files: list[tuple[Path, os.stat_result]] = []
         self._offsets: dict[Path, int] = {}
         self._partials: dict[Path, str] = {}
-        self._source_generations: dict[Path, int] = {}
         self._last_snapshot: RateSnapshot | None = None
         self._last_full_session_scan_at: float | None = None
         self.last_error: str | None = None
-        home_key = hashlib.sha256(str(self.codex_home.resolve()).encode("utf-8")).hexdigest()[:24]
-        self._supersession_path = supersession_path or (
-            Path(tempfile.gettempdir()) / f"codex-usage-supersession-{home_key}.json"
-        )
-        self._superseded: set[str] = set()
-        self._supersession_dirty = False
-        self._supersession_error: str | None = None
-        try:
-            self._superseded = read_supersession_history(self._supersession_path)
-        except (OSError, ValueError) as exc:
-            self._supersession_error = f"Supersession history unavailable: {type(exc).__name__}"
-
-    def _select_snapshot(self, snapshots: list[RateSnapshot]) -> None:
-        candidates = snapshots + ([self._last_snapshot] if self._last_snapshot else [])
-        candidates = [candidate for candidate in candidates
-                      if snapshot_fingerprint(candidate) not in self._superseded]
-        newest = select_rate_snapshot(candidates) if candidates else None
-        if newest is not None and snapshot_source_age_seconds(newest) is not None:
-            for candidate in candidates:
-                if snapshot_is_future(candidate):
-                    self._superseded.add(snapshot_fingerprint(candidate))
-                    self._supersession_dirty = True
-        self._last_snapshot = newest
-
-    def _save_supersession(self) -> None:
-        if not self._supersession_dirty:
-            return
-        temporary: Path | None = None
-        try:
-            # A nonblocking OS lock is released even if the process exits.
-            # Contention leaves the dirty flag set for the next polling cycle.
-            with self._supersession_path.with_suffix(".lock").open("a+b") as lock:
-                if os.name == "nt":
-                    import msvcrt
-                    if lock.seek(0, os.SEEK_END) == 0:
-                        lock.write(b"\0")
-                        lock.flush()
-                    lock.seek(0)
-                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                self._superseded.update(read_supersession_history(self._supersession_path))
-                descriptor, name = tempfile.mkstemp(prefix=self._supersession_path.stem + "-", suffix=".tmp",
-                                                     dir=self._supersession_path.parent)
-                temporary = Path(name)
-                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                    json.dump(sorted(self._superseded), handle)
-                temporary.replace(self._supersession_path)
-            self._supersession_dirty = False
-            self._supersession_error = None
-        except (OSError, ValueError) as exc:
-            self._supersession_error = f"Supersession history not saved: {type(exc).__name__}"
-        finally:
-            if temporary is not None:
-                try:
-                    temporary.unlink(missing_ok=True)
-                except OSError:
-                    pass
+        self._clock_mismatch = False
 
     def read_updates(
         self,
@@ -1269,14 +1154,8 @@ class RateLogReader:
             snapshots: list[RateSnapshot] = []
             token_events: list[TokenEvent] = []
             for path, stat_result in active_files:
-                if stat_result.st_size < self._offsets.get(path, 0):
-                    self._source_generations[path] = self._source_generations.get(path, 0) + 1
                 text = self._read_file_updates(path, stat_result, force_tail=force_rescan)
-                complete_end = self._offsets.get(path, 0) - len(self._partials.get(path, "").encode("utf-8"))
-                source_offset = complete_end - len(text.encode("utf-8"))
-                generation = (stat_result.st_dev, stat_result.st_ino, self._source_generations.get(path, 0))
-                snapshots.extend(replace(snapshot, source_generation=generation)
-                                 for snapshot in parse_rate_snapshots_from_text(text, str(path), source_offset))
+                snapshots.extend(parse_rate_snapshots_from_text(text, str(path)))
                 token_events.extend(parse_token_events_from_text(text, str(path)))
 
             sqlite_snapshot = self.sqlite_reader.latest_snapshot(
@@ -1287,9 +1166,13 @@ class RateLogReader:
                 snapshots.append(sqlite_snapshot)
 
             if snapshots:
-                self._select_snapshot(snapshots)
-            self._save_supersession()
-            self.last_error = self.last_error or self._supersession_error
+                newest = max(snapshots, key=timestamp_sort_key)
+                if self._last_snapshot is None or timestamp_sort_key(newest) >= timestamp_sort_key(self._last_snapshot):
+                    self._last_snapshot = newest
+            if snapshot_clock_mismatch(self._last_snapshot):
+                self._clock_mismatch = True
+            if self._last_snapshot is not None and self._clock_mismatch:
+                self._last_snapshot = replace(self._last_snapshot, clock_mismatch=True)
             return LogReadBatch(snapshot=self._last_snapshot, token_events=token_events)
         except Exception as exc:  # Defensive: never let a log race crash the overlay.
             self.last_error = str(exc)
@@ -1412,9 +1295,6 @@ class RateLogReader:
     def _prune_tracking(self, active_paths: set[Path]) -> None:
         for tracked in list(self._offsets):
             if tracked not in active_paths:
-                # Its next read has no byte checkpoint; never compare that new
-                # scan against cached positions from the discarded generation.
-                self._source_generations[tracked] = self._source_generations.get(tracked, 0) + 1
                 self._offsets.pop(tracked, None)
                 self._partials.pop(tracked, None)
 
@@ -2540,6 +2420,8 @@ def snapshot_source_age_seconds(snapshot: RateSnapshot | None, now: float | None
 def rate_data_status(snapshot: RateSnapshot | None, now: float | None = None) -> str:
     if snapshot is None:
         return "missing"
+    if snapshot_clock_mismatch(snapshot, now):
+        return "clock_mismatch"
     age = snapshot_source_age_seconds(snapshot, now)
     if age is None or age >= RATE_DATA_STALE_AFTER_SECONDS:
         return "stale"
@@ -2548,9 +2430,22 @@ def rate_data_status(snapshot: RateSnapshot | None, now: float | None = None) ->
 
 def rate_window_status(snapshot: RateSnapshot | None, window: RateWindow, now: float | None = None) -> str:
     current = time.time() if now is None else now
+    if snapshot_clock_mismatch(snapshot, current):
+        return "clock_mismatch"
     if window.resets_at is not None and current >= window.resets_at:
         return "reset_pending"
     return rate_data_status(snapshot, current)
+
+
+def snapshot_clock_mismatch(snapshot: RateSnapshot | None, now: float | None = None) -> bool:
+    if snapshot is None:
+        return False
+    current = time.time() if now is None else now
+    times = (timestamp_to_epoch(snapshot.timestamp), snapshot.source_observed_at)
+    return snapshot.clock_mismatch or any(
+        value is not None and value > current + RATE_SOURCE_FUTURE_TOLERANCE_SECONDS
+        for value in times
+    )
 
 
 def snapshot_has_active_limit(snapshot: RateSnapshot | None) -> bool:
@@ -4265,9 +4160,13 @@ class OverlayApp:
     def display_widgets(self) -> list[DisplayWidget]:
         widgets: list[DisplayWidget] = []
         selected = effective_display_windows(self.settings, self.snapshot)
+        clock_mismatch = snapshot_clock_mismatch(self.snapshot)
+        if clock_mismatch:
+            widgets.append(DisplayWidget("rate_clock_mismatch", "Usage unavailable - clock mismatch", COLOR_AMBER))
+            selected = []
         include_window_label = len(selected) > 1
         show_resets = bool(self.settings.get("show_resets", False))
-        if not selected:
+        if not selected and not clock_mismatch:
             widgets.append(DisplayWidget("rate_waiting", "Waiting for Codex rate data", COLOR_MUTED))
         for key in selected:
             rate_window = self.get_window(key)
@@ -4685,7 +4584,9 @@ class OverlayApp:
                         else f"{rate_window.remaining_percent}% remaining"
                     )
                     status = rate_window_status(self.snapshot, rate_window)
-                    if status == "reset_pending":
+                    if status == "clock_mismatch":
+                        value = "Usage unavailable - clock mismatch"
+                    elif status == "reset_pending":
                         value = "-- reset pending"
                     elif status == "stale":
                         value += " stale"
@@ -4912,6 +4813,9 @@ def print_status() -> int:
     if snapshot is None:
         print("No Codex rate data found.")
         return 1
+    if snapshot_clock_mismatch(snapshot):
+        print("Usage unavailable - clock mismatch")
+        return 0
     parts = []
     for key in VALID_DISPLAY_WINDOWS:
         rate_window = snapshot.primary if key == "primary" else snapshot.secondary

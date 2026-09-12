@@ -5,7 +5,6 @@ import os
 import sqlite3
 import sys
 import tempfile
-import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -4034,8 +4033,26 @@ class DisplayWidgetTests(unittest.TestCase):
                                 source_observed_at=self.now if kind == "logs_2.sqlite" else None)
             with self.subTest(kind=kind):
                 self.assertEqual(overlay.rate_data_status(candidate, self.now), "recent")
-                self.assertEqual(overlay.rate_data_status(candidate, self.now - 3600), "stale")
-                self.assertEqual(overlay.rate_data_status(candidate, self.now - 600), "stale")
+                self.assertEqual(overlay.rate_data_status(candidate, self.now - 3600), "clock_mismatch")
+                self.assertEqual(overlay.rate_data_status(candidate, self.now - 600), "clock_mismatch")
+
+    def test_clock_mismatch_hides_percentages_on_every_surface(self):
+        snapshot = replace(self.snapshot(
+            primary=overlay.RateWindow("7d", 10080, 77, 23, int(self.now - 1)),
+        ), clock_mismatch=True, rate_limit_reached_type="primary")
+        app = self.make_app(snapshot)
+        self.assertEqual(app.display_widgets()[0].text, "Usage unavailable - clock mismatch")
+        menu = MenuModelTests().make_app()
+        menu.snapshot = snapshot
+        label = next(row.label for row in menu.build_detail_menu_rows() if row.label and row.label.startswith("7d:"))
+        self.assertNotIn("23%", label)
+        self.assertIn("clock mismatch", label)
+        with mock.patch.object(overlay.RateLogReader, "latest_snapshot", return_value=snapshot), mock.patch("builtins.print") as output:
+            overlay.print_status()
+        self.assertEqual(output.call_args.args[0], "Usage unavailable - clock mismatch")
+        self.assertFalse(overlay.snapshot_has_active_limit(snapshot))
+        app.settings["show_api_cost_estimate"] = True
+        self.assertTrue(any(widget.key == "api_cost" for widget in app.display_widgets()))
 
     def test_limit_flag_is_active_only_for_recent_unexpired_windows(self):
         snapshot = replace(self.snapshot(
@@ -4152,108 +4169,8 @@ class DisplayWidgetTests(unittest.TestCase):
         self.assertEqual(widgets[0].text, "limit -- reset --")
 
 
-class ClockRollbackReaderTests(unittest.TestCase):
-    def test_cross_source_supersession_survives_catchup_and_restart(self):
-        for old_source, first_read_at in ((source, timestamp) for source in ("session", "sqlite") for timestamp in (6_400, 7_000)):
-            with self.subTest(old_source=old_source, first_read_at=first_read_at), tempfile.TemporaryDirectory() as directory:
-                home = Path(directory)
-                sessions = home / "sessions"
-                sessions.mkdir()
-                path = sessions / "rollout.jsonl"
-                db = home / "logs_2.sqlite"
-                history = home / "supersession.json"
-                create_logs_db(db, [])
-                def append(source, epoch, used):
-                    if source == "sqlite":
-                        append_logs_db(db, [IncrementalSqliteReaderTests().row(epoch, used)])
-                    else:
-                        with path.open("a", encoding="utf-8") as handle:
-                            handle.write(token_count_line(overlay.timestamp_from_epoch(epoch),
-                                primary={"used_percent": used, "window_minutes": 300}) + "\n")
-                append(old_source, 10_000, 77)
-                reader = overlay.RateLogReader(home, supersession_path=history)
-                with mock.patch.object(overlay.time, "time", return_value=10_000):
-                    self.assertEqual(reader.latest_snapshot(force_rescan=True, now=0).primary.remaining_percent, 23)
-                append("sqlite" if old_source == "session" else "session", 6_400, 2)
-                with mock.patch.object(overlay.time, "time", return_value=first_read_at):
-                    self.assertEqual(reader.latest_snapshot(now=40).primary.remaining_percent, 98)
-                saved = json.loads(history.read_text())
-                self.assertTrue(saved)
-                self.assertTrue(all(len(key) == 64 for key in saved))
-                with mock.patch.object(overlay.time, "time", return_value=10_100):
-                    restarted = overlay.RateLogReader(home, supersession_path=history)
-                    for candidate in (reader, restarted):
-                        self.assertEqual(candidate.latest_snapshot(force_rescan=True, now=50).primary.remaining_percent, 98)
-                    append(old_source, 10_100, 40)
-                    self.assertEqual(restarted.latest_snapshot(now=60).primary.remaining_percent, 60)
-
-    def test_supersession_save_failure_retries_without_losing_memory_state(self):
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            history = home / "missing" / "supersession.json"
-            reader = overlay.RateLogReader(home, supersession_path=history)
-            reader._superseded.add("a" * 64)
-            reader._supersession_dirty = True
-            reader._save_supersession()
-            self.assertTrue(reader._supersession_dirty)
-            self.assertIsNotNone(reader._supersession_error)
-            history.parent.mkdir()
-            reader._save_supersession()
-            self.assertFalse(reader._supersession_dirty)
-            self.assertIsNone(reader._supersession_error)
-            self.assertEqual(overlay.RateLogReader(home, supersession_path=history)._superseded, {"a" * 64})
-
-    def test_concurrent_history_writers_retry_and_merge(self):
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            history = home / "supersession.json"
-            first = overlay.RateLogReader(home, supersession_path=history)
-            second = overlay.RateLogReader(home, supersession_path=history)
-            first._superseded = {"a" * 64}
-            second._superseded = {"b" * 64}
-            first._supersession_dirty = second._supersession_dirty = True
-            locked = threading.Event()
-            release = threading.Event()
-            original = overlay.tempfile.mkstemp
-            def pause_with_lock(**kwargs):
-                locked.set()
-                if not release.wait(5):
-                    raise OSError("test lock timeout")
-                return original(**kwargs)
-            with mock.patch.object(overlay.tempfile, "mkstemp", side_effect=pause_with_lock):
-                writer = threading.Thread(target=first._save_supersession)
-                writer.start()
-                try:
-                    self.assertTrue(locked.wait(5))
-                    second._save_supersession()
-                    self.assertTrue(second._supersession_dirty)
-                finally:
-                    release.set()
-                    writer.join(5)
-            self.assertFalse(writer.is_alive())
-            self.assertFalse(first._supersession_dirty)
-            second._save_supersession()
-            self.assertFalse(second._supersession_dirty)
-            self.assertEqual(overlay.read_supersession_history(history), {"a" * 64, "b" * 64})
-            self.assertEqual(list(home.glob("*.tmp")), [])
-
-    def test_pruned_session_truncated_in_place_gets_new_generation(self):
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            sessions = home / "sessions"
-            sessions.mkdir()
-            path = sessions / "rollout.jsonl"
-            old = token_count_line("2026-09-12T10:00:00Z", primary={"used_percent": 77, "window_minutes": 300}) + "\n"
-            new = token_count_line("2026-09-12T10:01:00Z", primary={"used_percent": 2, "window_minutes": 300}) + "\n"
-            path.write_text(old * 2, encoding="utf-8")
-            reader = overlay.RateLogReader(home, supersession_path=home / "supersession.json")
-            self.assertEqual(reader.latest_snapshot(force_rescan=True, now=0).primary.remaining_percent, 23)
-            reader._prune_tracking(set())
-            self.assertNotIn(path, reader._offsets)
-            path.write_text(new, encoding="utf-8")
-            self.assertEqual(reader.latest_snapshot(force_rescan=True, now=40).primary.remaining_percent, 98)
-
-    def test_source_order_survives_clock_catchup_rescan_and_restart(self):
+class ClockMismatchReaderTests(unittest.TestCase):
+    def test_mismatch_stays_latched_until_reader_restart(self):
         for source in ("session", "sqlite"):
             with self.subTest(source=source), tempfile.TemporaryDirectory() as directory:
                 home = Path(directory)
@@ -4261,67 +4178,26 @@ class ClockRollbackReaderTests(unittest.TestCase):
                 sessions.mkdir()
                 path = sessions / "rollout.jsonl"
                 db = home / "logs_2.sqlite"
-                row = IncrementalSqliteReaderTests().row
-                def event(timestamp, used):
-                    return token_count_line(timestamp, primary={"used_percent": used, "window_minutes": 300}) + "\n"
-                if source == "session":
-                    path.write_text(event("1970-01-01T02:46:40Z", 77), encoding="utf-8")
-                else:
-                    create_logs_db(db, [row(10_000, 77)])
+                if source == "sqlite":
+                    create_logs_db(db, [])
+                def append(epoch):
+                    if source == "sqlite":
+                        append_logs_db(db, [IncrementalSqliteReaderTests().row(epoch, 2)])
+                    else:
+                        with path.open("a", encoding="utf-8") as handle:
+                            handle.write(token_count_line(overlay.timestamp_from_epoch(epoch),
+                                primary={"used_percent": 2, "window_minutes": 300}) + "\n")
+                append(10_000)
                 reader = overlay.RateLogReader(home)
-                with mock.patch.object(overlay.time, "time", return_value=10_000):
-                    self.assertEqual(reader.latest_snapshot(force_rescan=True, now=0).primary.remaining_percent, 23)
-                if source == "session":
-                    with path.open("a", encoding="utf-8") as handle:
-                        handle.write(event("1970-01-01T01:46:40Z", 2))
-                else:
-                    append_logs_db(db, [row(6_400, 2)])
-                with mock.patch.object(overlay.time, "time", return_value=6_400):
-                    self.assertEqual(reader.latest_snapshot(now=10).primary.remaining_percent, 98)
+                with mock.patch.object(overlay.time, "time", return_value=7_000):
+                    self.assertEqual(overlay.rate_data_status(reader.latest_snapshot(force_rescan=True, now=0)), "clock_mismatch")
                 with mock.patch.object(overlay.time, "time", return_value=10_100):
-                    for candidate in (reader, overlay.RateLogReader(home)):
-                        snapshot = candidate.latest_snapshot(force_rescan=True, now=20)
-                        self.assertEqual(snapshot.primary.remaining_percent, 98)
-                        self.assertEqual(overlay.rate_data_status(snapshot), "stale")
-
-    def test_sqlite_and_combined_readers_recover_after_clock_rollback(self):
-        for combined in (False, True):
-            with self.subTest(combined=combined), tempfile.TemporaryDirectory() as directory:
-                home = Path(directory)
-                db = home / "logs_2.sqlite"
-                row = IncrementalSqliteReaderTests().row
-                create_logs_db(db, [row(10_000, 77)])
-                reader = overlay.RateLogReader(home) if combined else overlay.SqliteRateLimitReader(db)
-                with mock.patch.object(overlay.time, "time", return_value=10_000):
-                    self.assertEqual(reader.latest_snapshot(force_rescan=True, now=0).primary.remaining_percent, 23)
-                append_logs_db(db, [row(6_400, 2)])
-                with mock.patch.object(overlay.time, "time", return_value=6_400):
-                    for rescan in (False, True):
-                        snapshot = reader.latest_snapshot(force_rescan=rescan, now=10)
-                        self.assertEqual(snapshot.primary.remaining_percent, 98)
-                        self.assertEqual(overlay.rate_data_status(snapshot), "recent")
-
-    def test_session_append_beats_future_sqlite_cache_and_rescanned_event(self):
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            sessions = home / "sessions"
-            sessions.mkdir()
-            path = sessions / "rollout.jsonl"
-            def event(timestamp, used):
-                return token_count_line(timestamp, primary={"used_percent": used, "window_minutes": 300}) + "\n"
-            path.write_text(event("1970-01-01T02:46:40Z", 77), encoding="utf-8")
-            create_logs_db(home / "logs_2.sqlite", [IncrementalSqliteReaderTests().row(10_000, 77)])
-            reader = overlay.RateLogReader(home)
-            with mock.patch.object(overlay.time, "time", return_value=10_000):
-                self.assertEqual(reader.latest_snapshot(force_rescan=True, now=0).primary.remaining_percent, 23)
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(event("1970-01-01T01:46:40Z", 2))
-            with mock.patch.object(overlay.time, "time", return_value=6_400):
-                for rescan in (False, True):
-                    snapshot = reader.latest_snapshot(force_rescan=rescan, now=10)
-                    self.assertEqual(snapshot.primary.remaining_percent, 98)
-                    self.assertEqual(snapshot.source_kind, "session_jsonl")
-                    self.assertEqual(overlay.rate_data_status(snapshot), "recent")
+                    self.assertEqual(overlay.rate_data_status(reader.latest_snapshot(force_rescan=True, now=10)), "clock_mismatch")
+                append(10_200)
+                with mock.patch.object(overlay.time, "time", return_value=10_200):
+                    self.assertEqual(overlay.rate_data_status(reader.latest_snapshot(force_rescan=True, now=20)), "clock_mismatch")
+                    restarted = overlay.RateLogReader(home)
+                    self.assertEqual(overlay.rate_data_status(restarted.latest_snapshot(force_rescan=True)), "recent")
 
 
 if __name__ == "__main__":
