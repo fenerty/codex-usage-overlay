@@ -15,6 +15,8 @@
 - Suppress cached LIMIT flags once readings are stale or a window expires,
   mask expired percentages in Details, and treat source times more than five
   seconds ahead of the local clock as stale.
+- Allow fresh readings to replace future-dated cached snapshots after a clock
+  rollback, including SQLite/session source arbitration and full rescans.
 
 ## 0.1.12 - 2026-09-03
 

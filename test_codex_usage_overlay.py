@@ -4151,5 +4151,46 @@ class DisplayWidgetTests(unittest.TestCase):
         self.assertEqual(widgets[0].text, "limit -- reset --")
 
 
+class ClockRollbackReaderTests(unittest.TestCase):
+    def test_sqlite_and_combined_readers_recover_after_clock_rollback(self):
+        for combined in (False, True):
+            with self.subTest(combined=combined), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory)
+                db = home / "logs_2.sqlite"
+                row = IncrementalSqliteReaderTests().row
+                create_logs_db(db, [row(10_000, 77)])
+                reader = overlay.RateLogReader(home) if combined else overlay.SqliteRateLimitReader(db)
+                with mock.patch.object(overlay.time, "time", return_value=10_000):
+                    self.assertEqual(reader.latest_snapshot(force_rescan=True, now=0).primary.remaining_percent, 23)
+                append_logs_db(db, [row(6_400, 2)])
+                with mock.patch.object(overlay.time, "time", return_value=6_400):
+                    for rescan in (False, True):
+                        snapshot = reader.latest_snapshot(force_rescan=rescan, now=10)
+                        self.assertEqual(snapshot.primary.remaining_percent, 98)
+                        self.assertEqual(overlay.rate_data_status(snapshot), "recent")
+
+    def test_session_append_beats_future_sqlite_cache_and_rescanned_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            sessions = home / "sessions"
+            sessions.mkdir()
+            path = sessions / "rollout.jsonl"
+            def event(timestamp, used):
+                return token_count_line(timestamp, primary={"used_percent": used, "window_minutes": 300}) + "\n"
+            path.write_text(event("1970-01-01T02:46:40Z", 77), encoding="utf-8")
+            create_logs_db(home / "logs_2.sqlite", [IncrementalSqliteReaderTests().row(10_000, 77)])
+            reader = overlay.RateLogReader(home)
+            with mock.patch.object(overlay.time, "time", return_value=10_000):
+                self.assertEqual(reader.latest_snapshot(force_rescan=True, now=0).primary.remaining_percent, 23)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(event("1970-01-01T01:46:40Z", 2))
+            with mock.patch.object(overlay.time, "time", return_value=6_400):
+                for rescan in (False, True):
+                    snapshot = reader.latest_snapshot(force_rescan=rescan, now=10)
+                    self.assertEqual(snapshot.primary.remaining_percent, 98)
+                    self.assertEqual(snapshot.source_kind, "session_jsonl")
+                    self.assertEqual(overlay.rate_data_status(snapshot), "recent")
+
+
 if __name__ == "__main__":
     unittest.main()

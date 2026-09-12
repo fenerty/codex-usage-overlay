@@ -849,6 +849,22 @@ def timestamp_sort_key(snapshot: RateSnapshot) -> tuple[float, str, str]:
     return (parsed_timestamp, source_priority, snapshot.source_path or "")
 
 
+def select_rate_snapshot(
+    snapshots: list[RateSnapshot], previous: RateSnapshot | None = None,
+) -> RateSnapshot:
+    candidates = snapshots + ([previous] if previous is not None else [])
+    future_cutoff = time.time() + RATE_SOURCE_FUTURE_TOLERANCE_SECONDS
+
+    def selection_key(snapshot: RateSnapshot) -> tuple[bool, tuple[float, str, str]]:
+        source_times = (timestamp_to_epoch(snapshot.timestamp), snapshot.source_observed_at)
+        future = any(value is not None and value > future_cutoff for value in source_times)
+        # A rollback must not let a cached future timestamp outrank fresh data.
+        # Apply this to the whole batch too, including rescanned historical rows.
+        return (not future, timestamp_sort_key(snapshot))
+
+    return max(candidates, key=selection_key)
+
+
 def read_tail_text(path: Path, max_bytes: int = TAIL_BYTES) -> str:
     try:
         size = path.stat().st_size
@@ -1099,12 +1115,7 @@ class SqliteRateLimitReader:
                     break
                 before_row_id = min(row[0] for row in rows)
             if snapshots:
-                newest = max(snapshots, key=timestamp_sort_key)
-                if (
-                    self._last_snapshot is None
-                    or timestamp_sort_key(newest) >= timestamp_sort_key(self._last_snapshot)
-                ):
-                    self._last_snapshot = newest
+                self._last_snapshot = select_rate_snapshot(snapshots, self._last_snapshot)
 
             self._last_row_id = max_row_id
             self._database_identity = database_identity
@@ -1164,9 +1175,7 @@ class RateLogReader:
                 snapshots.append(sqlite_snapshot)
 
             if snapshots:
-                newest = max(snapshots, key=timestamp_sort_key)
-                if self._last_snapshot is None or timestamp_sort_key(newest) >= timestamp_sort_key(self._last_snapshot):
-                    self._last_snapshot = newest
+                self._last_snapshot = select_rate_snapshot(snapshots, self._last_snapshot)
             return LogReadBatch(snapshot=self._last_snapshot, token_events=token_events)
         except Exception as exc:  # Defensive: never let a log race crash the overlay.
             self.last_error = str(exc)
