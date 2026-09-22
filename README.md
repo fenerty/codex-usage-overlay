@@ -21,6 +21,10 @@ This is an independent utility and is not an official OpenAI or Codex project.
 - Uses the freshest local source available: `logs_2.sqlite` rate-limit websocket
   events first, session JSONL rate events as fallback.
 - Optional reset countdowns in the overlay.
+- Readings five minutes old or of unknown age show a compact amber `*` marker.
+  Details explains the marker and shows the source age.
+  After a window expires, its old percentage is replaced by `-- reset pending`
+  until a new window is reported. Fresh local events clear the warning.
 - Optional manual token counter with input, cached input, output, reasoning, and
   total token details.
 - Optional API-equivalent cost estimate using local token counts and documented
@@ -146,18 +150,44 @@ paths and raw transcript content are not written.
 
 - Codex local log formats are unofficial implementation details and may change.
 - Displayed rate limits are only as fresh as the local Codex logs.
+- Percentages mean **remaining**, not used. `23%*` is the last known
+  reading, not a live account check. The menu shows the source and its age;
+  **Refresh** rereads local files and cannot request fresh account data.
+  For a current account reading, check Codex's usage view. New local usage
+  events are normally written while Codex runs a task. Resets or activity
+  elsewhere may not appear locally until another event is written, even
+  inside the five-minute freshness threshold.
 - The rate display intentionally tracks only the main `codex` allowance. Token
   counting remains model-independent.
 - The API cost estimate is approximate and is not actual Codex subscription
   billing.
-- GPT-5.6 Sol, Terra, and Luna use their published short- and long-context
+- GPT-6 Astra, Sol, and Luna and GPT-5.6 Sol, Terra, and Luna use their published short- and long-context
   Standard API prices. The unpublished GPT-5.3-Codex-Spark preview uses a clearly
   labeled GPT-5.5 proxy. Unknown, custom, and future models remain unpriced.
-- GPT-5.6 pricing publishes cache-write premiums, but local Codex events do not
+- GPT-6 and GPT-5.6 pricing publishes cache-write premiums, but local Codex events do not
   report cache-write token counts. Those rates are exposed as metadata while
   cache-write costs are excluded from the estimate total.
 - If models change during a manual token-counter window, reset the counter for a
   cleaner cost estimate.
+
+### Pricing maintenance
+
+GPT-6 prices were verified against the
+[official Standard API pricing](https://developers.openai.com/api/docs/pricing)
+on September 22, 2026. GPT-6 Sol is $2 input / $0.20 cached input / $10 output
+per million tokens; GPT-6 Luna is $0.10 / $0.01 / $0.50. Requests above 272K
+input tokens use twice the input/cache rates and 1.5 times the output rates.
+Cache-write metadata is $2.50 for Sol and $0.125 for Luna per million tokens
+(twice those rates above 272K); cache writes remain excluded from totals.
+GPT-5.6 prices were verified September 12, 2026. GPT-5.6 Sol uses the promotional price published as
+available at least through November 21, 2026. Estimates apply the configured
+prices to the whole manual counter window; they are not historical invoices.
+Fast mode, regional uplifts, and tool fees are not included.
+
+New model rollouts require an explicit pricing-table update. Unsupported models
+show `API est. unpriced` rather than using a guessed price. When updating prices,
+verify input, cached input, cache write, output, and long-context rates and add
+calculation coverage before release. The overlay does not fetch prices online.
 
 ## Troubleshooting
 
@@ -218,3 +248,18 @@ python -m py_compile codex_usage_overlay.pyw test_codex_usage_overlay.py
 ```
 
 The project intentionally uses only the Python standard library.
+
+### Clock changes
+
+If a selected usage event is more than five seconds ahead of the system clock,
+the overlay shows `Usage unavailable - clock mismatch` instead of percentages.
+That warning stays active for the lifetime of the reader, including Refresh;
+clock catch-up alone does not make its cached reading trustworthy again.
+Check usage directly in Codex while the warning is present. After correcting
+the clock, run a new Codex task and restart the overlay to begin a new reader.
+
+Automatic reconstruction of event order across clock changes, separate logs,
+and restarts is outside this utility's scope. Source timestamps are assumed
+consistent at startup; undetectable historical clock changes cannot be inferred.
+No rollback-history files are read or written. Hash/lock files from earlier
+PR builds are inert and may be removed manually.
