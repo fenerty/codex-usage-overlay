@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Replace the stale suffix with a compact `*` in the overlay, Details, and CLI.
+  Explain the marker in Details; retain freshness thresholds and reset safeguards.
+- Add GPT-6 Sol and Luna Standard API estimates using prices verified September
+  22, 2026, including long-context rates and cache-write metadata.
+
 ## 0.1.13 - 2026-09-12
 
 - Restore API-equivalent estimates for GPT-6 Astra using its published Standard

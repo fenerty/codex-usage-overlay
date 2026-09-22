@@ -268,7 +268,8 @@ class LogReadBatch:
 
 
 # Official OpenAI Standard API prices, per 1M text tokens.
-# Astra and GPT-5.6 rates verified 2026-09-12; Sol includes promotional pricing.
+# GPT-6 rates verified 2026-09-22; GPT-5.6 rates verified 2026-09-12.
+# GPT-5.6 Sol includes promotional pricing.
 # Source: https://developers.openai.com/api/docs/pricing
 API_MODEL_PRICING = {
     "gpt-6-astra": ModelPricing(
@@ -279,6 +280,24 @@ API_MODEL_PRICING = {
         long_context_cached_input_per_million=2.00,
         long_context_cache_write_per_million=25.00,
         long_context_output_per_million=75.00,
+    ),
+    "gpt-6-sol": ModelPricing(
+        "gpt-6 Sol", 2.00, 0.20, 10.00, API_PRICING_SOURCE_URL,
+        cache_write_per_million=2.50,
+        long_context_threshold_tokens=LONG_CONTEXT_INPUT_THRESHOLD_TOKENS,
+        long_context_input_per_million=4.00,
+        long_context_cached_input_per_million=0.40,
+        long_context_cache_write_per_million=5.00,
+        long_context_output_per_million=15.00,
+    ),
+    "gpt-6-luna": ModelPricing(
+        "gpt-6 Luna", 0.10, 0.01, 0.50, API_PRICING_SOURCE_URL,
+        cache_write_per_million=0.125,
+        long_context_threshold_tokens=LONG_CONTEXT_INPUT_THRESHOLD_TOKENS,
+        long_context_input_per_million=0.20,
+        long_context_cached_input_per_million=0.02,
+        long_context_cache_write_per_million=0.25,
+        long_context_output_per_million=0.75,
     ),
     "gpt-5.6-sol": ModelPricing(
         "gpt-5.6 Sol", 4.00, 0.40, 20.00, API_PRICING_SOURCE_URL,
@@ -4224,7 +4243,7 @@ class OverlayApp:
         else:
             text = remaining
         if status == "stale":
-            text += " stale"
+            text += "*"
         if show_resets:
             text += f" reset {format_reset_countdown(rate_window.resets_at)}"
         return text
@@ -4589,13 +4608,19 @@ class OverlayApp:
                     elif status == "reset_pending":
                         value = "-- reset pending"
                     elif status == "stale":
-                        value += " stale"
+                        value += "*"
                     rows.append(
                         MenuRow.disabled(
                             f"{rate_window.label}: {value}, resets {format_reset_time(rate_window.resets_at)}"
                         )
                     )
 
+        if self.snapshot and any(
+            rate_window_status(self.snapshot, window) == "stale"
+            for key in available_rate_window_keys(self.snapshot)
+            if (window := self.get_window(key)) is not None
+        ):
+            rows.append(MenuRow.disabled("* Last known reading; source is 5+ minutes old or age is unknown"))
         rows.append(MenuRow.separator())
         rows.append(MenuRow.disabled("Token Counter"))
         rows.append(MenuRow.disabled(self.token_counter.display_text()))
@@ -4824,7 +4849,7 @@ def print_status() -> int:
             if status == "reset_pending":
                 parts.append(f"{rate_window.label} -- reset pending")
             else:
-                suffix = " stale" if status == "stale" else ""
+                suffix = "*" if status == "stale" else ""
                 parts.append(f"{rate_window.label} {rate_window.remaining_percent}%{suffix}")
     if snapshot_has_active_limit(snapshot):
         parts.append("LIMIT")
