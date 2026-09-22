@@ -1485,6 +1485,8 @@ class ApiCostEstimateTests(unittest.TestCase):
     def test_current_models_use_exact_published_standard_rates(self):
         expected = {
             "gpt-6-astra": (10.00, 1.00, 12.50, 50.00, 20.00, 2.00, 25.00, 75.00),
+            "gpt-6-sol": (2.00, 0.20, 2.50, 10.00, 4.00, 0.40, 5.00, 15.00),
+            "gpt-6-luna": (0.10, 0.01, 0.125, 0.50, 0.20, 0.02, 0.25, 0.75),
             "gpt-5.6-sol": (4.00, 0.40, 5.00, 20.00, 8.00, 0.80, 10.00, 30.00),
             "gpt-5.6-terra": (2.00, 0.20, 2.50, 12.00, 4.00, 0.40, 5.00, 18.00),
             "gpt-5.6-luna": (0.20, 0.02, 0.25, 1.20, 0.40, 0.04, 0.50, 1.80),
@@ -1602,6 +1604,29 @@ class ApiCostEstimateTests(unittest.TestCase):
     def test_no_detected_model_still_shows_waiting_estimate(self):
         estimate = overlay.estimate_api_cost(overlay.TokenUsage(), overlay.DetectedModel(None, "test"))
         self.assertEqual(overlay.format_api_cost_estimate(estimate), "API est. --")
+
+    def test_gpt_6_sol_and_luna_price_mixed_context_requests(self):
+        short = overlay.TokenUsage(input_tokens=100_000, cached_input_tokens=40_000,
+                                   output_tokens=10_000, reasoning_output_tokens=5_000)
+        long = overlay.TokenUsage(input_tokens=300_000, cached_input_tokens=100_000,
+                                  output_tokens=20_000, reasoning_output_tokens=10_000)
+        for model, costs in (
+            ("gpt-6-sol", (0.92, 0.048, 0.40, 1.368)),
+            ("gpt-6-luna", (0.046, 0.0024, 0.020, 0.0684)),
+        ):
+            with self.subTest(model=model):
+                estimate = overlay.estimate_api_cost(
+                    overlay.add_token_usage(short, long), overlay.DetectedModel(model, "test"),
+                    short_context_usage=short, long_context_usage=long, long_context_request_count=1,
+                )
+                self.assertEqual(estimate.pricing_model, model)
+                self.assertFalse(estimate.pricing_is_proxy)
+                for actual, expected in zip(
+                    (estimate.input_cost, estimate.cached_input_cost, estimate.output_cost, estimate.total_cost),
+                    costs,
+                ):
+                    self.assertAlmostEqual(actual, expected)
+                self.assertIsNone(estimate.cache_write_cost)
 
     def test_formats_costs(self):
         self.assertEqual(overlay.format_api_cost(0), "$0.00")
@@ -3994,7 +4019,7 @@ class DisplayWidgetTests(unittest.TestCase):
         self.assertEqual(app.display_widgets()[0].text, "23%")
         with mock.patch.object(overlay.time, "time", return_value=self.now + 300):
             widget = app.display_widgets()[0]
-        self.assertEqual(widget.text, "23% stale")
+        self.assertEqual(widget.text, "23%*")
         self.assertEqual(widget.color, overlay.COLOR_AMBER)
 
     def test_new_snapshot_clears_stale_warning(self):
@@ -4002,7 +4027,7 @@ class DisplayWidgetTests(unittest.TestCase):
             primary=overlay.RateWindow("7d", 10080, 77.0, 23, int(self.now + 86400)),
         ))
         with mock.patch.object(overlay.time, "time", return_value=self.now + 600):
-            self.assertIn("stale", app.display_widgets()[0].text)
+            self.assertIn("*", app.display_widgets()[0].text)
             app.snapshot = overlay.RateSnapshot(
                 timestamp="2026-07-13T15:10:00Z",
                 primary=overlay.RateWindow("7d", 10080, 2.0, 98, int(self.now + 604800)),
@@ -4059,7 +4084,7 @@ class DisplayWidgetTests(unittest.TestCase):
             primary=overlay.RateWindow("7d", 10080, 100, 0, int(self.now + 600)),
         ), rate_limit_reached_type="primary")
         app = self.make_app(snapshot)
-        for elapsed, expected in ((0, "0% LIMIT"), (300, "0% stale"), (600, "-- reset pending")):
+        for elapsed, expected in ((0, "0% LIMIT"), (300, "0%*"), (600, "-- reset pending")):
             with self.subTest(elapsed=elapsed), mock.patch.object(overlay.time, "time", return_value=self.now + elapsed):
                 widget = app.display_widgets()[0]
                 self.assertEqual(widget.text, expected)
@@ -4068,6 +4093,7 @@ class DisplayWidgetTests(unittest.TestCase):
                     self.assertEqual(overlay.print_status(), 0)
                     text = output.call_args.args[0]
                 self.assertEqual("LIMIT" in text, elapsed == 0)
+                self.assertEqual(text, "7d 0%  LIMIT" if elapsed == 0 else f"7d {expected}")
 
     def test_expired_window_suppresses_snapshot_wide_limit_flag(self):
         snapshot = replace(self.snapshot(
@@ -4079,11 +4105,13 @@ class DisplayWidgetTests(unittest.TestCase):
     def test_details_mask_expired_values_and_mark_stale_values(self):
         app = MenuModelTests().make_app()
         app.snapshot = self.snapshot(primary=overlay.RateWindow("7d", 10080, 77, 23, int(self.now + 600)))
-        for elapsed, expected in ((0, "23% remaining"), (300, "23% remaining stale"), (600, "-- reset pending")):
+        for elapsed, expected in ((0, "23% remaining"), (300, "23% remaining*"), (600, "-- reset pending")):
             with self.subTest(elapsed=elapsed), mock.patch.object(overlay.time, "time", return_value=self.now + elapsed):
                 rows = app.build_detail_menu_rows()
                 label = next(row.label for row in rows if row.label and row.label.startswith("7d:"))
                 self.assertIn(expected, label)
+                footnotes = [row.label for row in rows if row.label and row.label.startswith("* Last known")]
+                self.assertEqual(len(footnotes), 1 if elapsed == 300 else 0)
                 if elapsed == 600:
                     self.assertNotIn("23%", label)
 
