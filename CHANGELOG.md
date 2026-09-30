@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add exact GPT-6.1 Sol Standard API rates while keeping GPT-6 Sol distinct.
+- Add a saved Astra Standard/Ultrafast API estimate choice. Show the effective
+  tier in the overlay, Details, and runtime state; Ultrafast is a selected
+  scenario for the whole counter window, not detected Codex billing.
 - Replace the stale suffix with a compact `*` in the overlay, Details, and CLI.
   Explain the marker in Details; retain freshness thresholds and reset safeguards.
 - Add GPT-6 Sol and Luna Standard API estimates using prices verified September

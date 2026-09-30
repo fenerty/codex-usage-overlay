@@ -110,6 +110,8 @@ Supported settings include:
 - `show_resets`: show reset countdowns
 - `show_token_counter`: show manual token counter
 - `show_api_cost_estimate`: show API-equivalent cost estimate
+- `astra_api_tier`: `standard` (default) or `ultrafast` for the Astra API
+  pricing scenario; other detected models use Standard rates
 
 ## Performance And Polling
 
@@ -161,9 +163,11 @@ paths and raw transcript content are not written.
   counting remains model-independent.
 - The API cost estimate is approximate and is not actual Codex subscription
   billing.
-- GPT-6 Astra, Sol, and Luna and GPT-5.6 Sol, Terra, and Luna use their published short- and long-context
-  Standard API prices. The unpublished GPT-5.3-Codex-Spark preview uses a clearly
-  labeled GPT-5.5 proxy. Unknown, custom, and future models remain unpriced.
+- GPT-6 Astra, GPT-6.1 Sol, GPT-6 Sol, and GPT-6 Luna, plus GPT-5.6 Sol, Terra,
+  and Luna, use published short- and long-context Standard API prices. Astra also
+  has a selectable Ultrafast API pricing scenario. The unpublished
+  GPT-5.3-Codex-Spark preview uses a clearly labeled GPT-5.5 proxy. Unknown,
+  custom, and future models remain unpriced.
 - GPT-6 and GPT-5.6 pricing publishes cache-write premiums, but local Codex events do not
   report cache-write token counts. Those rates are exposed as metadata while
   cache-write costs are excluded from the estimate total.
@@ -172,13 +176,23 @@ paths and raw transcript content are not written.
 
 ### Pricing maintenance
 
-GPT-6 prices were verified against the
-[official Standard API pricing](https://developers.openai.com/api/docs/pricing)
-on September 22, 2026. GPT-6 Sol is $2 input / $0.20 cached input / $10 output
-per million tokens; GPT-6 Luna is $0.10 / $0.01 / $0.50. Requests above 272K
-input tokens use twice the input/cache rates and 1.5 times the output rates.
-Cache-write metadata is $2.50 for Sol and $0.125 for Luna per million tokens
-(twice those rates above 272K); cache writes remain excluded from totals.
+GPT-6.1 Sol and Astra Ultrafast prices were verified against the
+[official API pricing table](https://developers.openai.com/api/docs/pricing)
+on September 30, 2026. GPT-6.1 Sol Standard rates per million tokens are
+$2 input / $0.10 cached input / $2.50 cache write / $10 output for short context,
+and $4 / $0.20 / $5 / $15 above 272K input tokens. GPT-6 Sol is a separate model
+with a $0.20 short-context cached-input rate; it is not mapped to GPT-6.1 Sol.
+GPT-6 Luna Standard rates are $0.10 / $0.01 / $0.125 / $0.50 for short context
+and twice the input/cache rates and 1.5 times the output rate above 272K.
+
+The **Astra API tier** menu choice defaults to Standard. Ultrafast applies only
+while Astra is detected; other models continue to use Standard rates. Its
+[published rates](https://developers.openai.com/api/docs/pricing?latest-pricing=ultrafast)
+are $60 / $6 / $75 / $300 for short context and $120 / $12 / $150 / $450 above
+272K input tokens, in input / cached input / cache write / output order per
+million tokens. The choice reprices the entire current token-counter window
+as a scenario. Local Codex events do not identify an API service tier.
+Cache-write rates are shown in Details and runtime state but excluded from totals.
 GPT-5.6 prices were verified September 12, 2026. GPT-5.6 Sol uses the promotional price published as
 available at least through November 21, 2026. Estimates apply the configured
 prices to the whole manual counter window; they are not historical invoices.
