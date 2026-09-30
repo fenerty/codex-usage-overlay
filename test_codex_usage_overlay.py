@@ -1486,6 +1486,7 @@ class ApiCostEstimateTests(unittest.TestCase):
         expected = {
             "gpt-6-astra": (10.00, 1.00, 12.50, 50.00, 20.00, 2.00, 25.00, 75.00),
             "gpt-6-sol": (2.00, 0.20, 2.50, 10.00, 4.00, 0.40, 5.00, 15.00),
+            "gpt-6.1-sol": (2.00, 0.10, 2.50, 10.00, 4.00, 0.20, 5.00, 15.00),
             "gpt-6-luna": (0.10, 0.01, 0.125, 0.50, 0.20, 0.02, 0.25, 0.75),
             "gpt-5.6-sol": (4.00, 0.40, 5.00, 20.00, 8.00, 0.80, 10.00, 30.00),
             "gpt-5.6-terra": (2.00, 0.20, 2.50, 12.00, 4.00, 0.40, 5.00, 18.00),
@@ -1516,6 +1517,28 @@ class ApiCostEstimateTests(unittest.TestCase):
                     pricing.long_context_threshold_tokens,
                     overlay.LONG_CONTEXT_INPUT_THRESHOLD_TOKENS,
                 )
+
+    def test_astra_ultrafast_uses_published_rates(self):
+        resolution = overlay.resolve_model_pricing("gpt-6-astra", "ultrafast")
+
+        self.assertEqual(resolution.pricing_model, "gpt-6-astra")
+        self.assertEqual(resolution.tier, "ultrafast")
+        self.assertFalse(resolution.is_proxy)
+        pricing = resolution.pricing
+        self.assertEqual(
+            (
+                pricing.input_per_million,
+                pricing.cached_input_per_million,
+                pricing.cache_write_per_million,
+                pricing.output_per_million,
+                pricing.long_context_input_per_million,
+                pricing.long_context_cached_input_per_million,
+                pricing.long_context_cache_write_per_million,
+                pricing.long_context_output_per_million,
+            ),
+            (60.00, 6.00, 75.00, 300.00, 120.00, 12.00, 150.00, 450.00),
+        )
+        self.assertEqual(pricing.long_context_threshold_tokens, 272_000)
 
     def test_gpt_56_alias_resolves_to_sol_without_proxy(self):
         estimate = overlay.estimate_api_cost(
@@ -1601,6 +1624,42 @@ class ApiCostEstimateTests(unittest.TestCase):
         self.assertIsNone(estimate.cache_write_cost)
         self.assertEqual(overlay.format_api_cost_estimate(estimate), "$6.84 API est.")
 
+    def test_astra_ultrafast_prices_whole_counter_window_as_a_scenario(self):
+        short = overlay.TokenUsage(input_tokens=100_000, cached_input_tokens=40_000,
+                                   output_tokens=10_000, reasoning_output_tokens=5_000)
+        long = overlay.TokenUsage(input_tokens=300_000, cached_input_tokens=100_000,
+                                  output_tokens=20_000, reasoning_output_tokens=10_000)
+        estimate = overlay.estimate_api_cost(
+            overlay.add_token_usage(short, long), overlay.DetectedModel("gpt-6-astra", "test"),
+            short_context_usage=short, long_context_usage=long,
+            long_context_request_count=1, astra_api_tier="ultrafast",
+        )
+
+        self.assertEqual(estimate.pricing_tier, "ultrafast")
+        self.assertAlmostEqual(estimate.input_cost, 27.60)
+        self.assertAlmostEqual(estimate.cached_input_cost, 1.44)
+        self.assertAlmostEqual(estimate.output_cost, 12.00)
+        self.assertAlmostEqual(estimate.total_cost, 41.04)
+        self.assertIsNone(estimate.cache_write_cost)
+        self.assertEqual(overlay.format_api_cost_estimate(estimate), "$41.04 API est. (Ultrafast)")
+
+    def test_ultrafast_preference_does_not_reprice_other_models(self):
+        usage = overlay.TokenUsage(input_tokens=1_000_000, cached_input_tokens=1_000_000)
+        old_sol = overlay.estimate_api_cost(
+            usage, overlay.DetectedModel("gpt-6-sol", "test"), astra_api_tier="ultrafast"
+        )
+        new_sol = overlay.estimate_api_cost(
+            usage, overlay.DetectedModel("gpt-6.1-sol", "test"), astra_api_tier="ultrafast"
+        )
+
+        self.assertEqual(old_sol.pricing_model, "gpt-6-sol")
+        self.assertEqual(new_sol.pricing_model, "gpt-6.1-sol")
+        self.assertEqual(old_sol.pricing_tier, "standard")
+        self.assertEqual(new_sol.pricing_tier, "standard")
+        self.assertAlmostEqual(old_sol.total_cost, 0.20)
+        self.assertAlmostEqual(new_sol.total_cost, 0.10)
+        self.assertEqual(overlay.format_api_cost_estimate(new_sol), "$0.10 API est.")
+
     def test_no_detected_model_still_shows_waiting_estimate(self):
         estimate = overlay.estimate_api_cost(overlay.TokenUsage(), overlay.DetectedModel(None, "test"))
         self.assertEqual(overlay.format_api_cost_estimate(estimate), "API est. --")
@@ -1612,6 +1671,7 @@ class ApiCostEstimateTests(unittest.TestCase):
                                   output_tokens=20_000, reasoning_output_tokens=10_000)
         for model, costs in (
             ("gpt-6-sol", (0.92, 0.048, 0.40, 1.368)),
+            ("gpt-6.1-sol", (0.92, 0.024, 0.40, 1.344)),
             ("gpt-6-luna", (0.046, 0.0024, 0.020, 0.0684)),
         ):
             with self.subTest(model=model):
@@ -1672,6 +1732,19 @@ class ModelDetectionTests(unittest.TestCase):
             self.assertEqual(detected.model, "gpt-5.5")
             self.assertEqual(detected.source, "logs_2.sqlite")
 
+    def test_detects_gpt_61_sol_from_logs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            self.create_logs_db(
+                home / "logs_2.sqlite",
+                ['session_task.turn model="gpt-6.1-sol"'],
+            )
+
+            detected = overlay.detect_latest_model(home)
+
+        self.assertEqual(detected.model, "gpt-6.1-sol")
+        self.assertEqual(detected.source, "logs_2.sqlite")
+
     def test_falls_back_to_config_model(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             home = Path(temp_dir)
@@ -1730,6 +1803,7 @@ class RuntimeStateTests(unittest.TestCase):
             self.assertEqual(state["api_cost_estimate"]["model"], "gpt-5.6-sol")
             self.assertEqual(state["api_cost_estimate"]["pricing_model"], "gpt-5.6-sol")
             self.assertFalse(state["api_cost_estimate"]["pricing_is_proxy"])
+            self.assertEqual(state["api_cost_estimate"]["pricing_tier"], "standard")
             self.assertEqual(
                 state["api_cost_estimate"]["pricing"]["long_context_threshold_tokens"],
                 272_000,
@@ -1755,6 +1829,26 @@ class RuntimeStateTests(unittest.TestCase):
             self.assertEqual(state["last_rate_snapshot"]["limit_id"], "codex")
             self.assertEqual(state["last_rate_snapshot"]["source_kind"], "logs_2.sqlite")
             self.assertEqual(state["runtime"], diagnostics)
+
+    def test_ultrafast_state_records_effective_tier_and_source(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "state.json"
+            estimate = overlay.estimate_api_cost(
+                overlay.TokenUsage(input_tokens=1_000, output_tokens=1_000),
+                overlay.DetectedModel("gpt-6-astra", "test"),
+                astra_api_tier="ultrafast",
+            )
+            self.assertTrue(overlay.RuntimeStateStore(path=path, pid=123).write(
+                None, overlay.TokenCounter(reset_at=1_000), estimate
+            ))
+            state = json.loads(path.read_text(encoding="utf-8"))
+
+        api_state = state["api_cost_estimate"]
+        self.assertEqual(api_state["pricing_tier"], "ultrafast")
+        self.assertEqual(api_state["pricing"]["source_url"], overlay.API_ULTRAFAST_PRICING_SOURCE_URL)
+        self.assertEqual(api_state["pricing"]["assumption"], overlay.API_ULTRAFAST_PRICING_ASSUMPTION)
+        self.assertIn("Ultrafast", api_state["display"])
+        self.assertFalse(api_state["cache_write_cost_included"])
 
     def test_ignores_stale_pid_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3722,6 +3816,7 @@ class MenuModelTests(unittest.TestCase):
             "show_resets": False,
             "show_token_counter": True,
             "show_api_cost_estimate": False,
+            "astra_api_tier": "standard",
             "layout_mode": "grid_2x2",
         }
         app.settings.update(settings)
@@ -3755,6 +3850,8 @@ class MenuModelTests(unittest.TestCase):
         self.assertIn("(*) Always", labels)
         self.assertIn("[x] Show Token Counter", labels)
         self.assertIn("[ ] Show API Cost Estimate", labels)
+        self.assertIn("(*) Astra API tier: Standard", labels)
+        self.assertIn("( ) Astra API tier: Ultrafast", labels)
         self.assertIn("(*) Horizontal", labels)
         self.assertIn("( ) Vertical", labels)
         self.assertFalse(any("Grid" in label for label in labels))
@@ -3804,6 +3901,30 @@ class MenuModelTests(unittest.TestCase):
             labels,
         )
         self.assertIn(overlay.CACHE_WRITE_TELEMETRY_NOTE, labels)
+
+    def test_astra_tier_menu_selects_ultrafast_and_details_show_effective_tier(self):
+        app = self.make_app(show_api_cost_estimate=True)
+        app.detected_model = overlay.DetectedModel("gpt-6-astra", "test")
+        rows = overlay.OverlayApp.build_menu_rows(app)
+        ultrafast_row = next(
+            row for row in rows if row.label == "( ) Astra API tier: Ultrafast"
+        )
+
+        self.assertTrue(ultrafast_row.invoke())
+        self.assertEqual(app.settings["astra_api_tier"], "ultrafast")
+        self.assertEqual(app.save_calls, 1)
+        self.assertEqual(app.render_calls, 1)
+        self.assertIn("(*) Astra API tier: Ultrafast", self.labels(app))
+
+        detail_rows = []
+        overlay.OverlayApp.add_api_estimate_menu_rows(app, detail_rows)
+        labels = [row.label for row in detail_rows if row.label]
+        self.assertIn("$0.00 API est. (Ultrafast)", labels)
+        self.assertIn("Pricing model: GPT-6-ASTRA; tier: Ultrafast (selected scenario)", labels)
+        self.assertIn(
+            "Rates /1M (short): input $60.00, cached $6.00, write $75.00, output $300.00",
+            labels,
+        )
 
     def test_layout_command_changes_mode_on_first_invocation(self):
         app = self.make_app(layout_mode="horizontal")
@@ -3872,7 +3993,18 @@ class DisplaySelectionTests(unittest.TestCase):
         self.assertFalse(settings["show_resets"])
         self.assertFalse(settings["show_token_counter"])
         self.assertFalse(settings["show_api_cost_estimate"])
+        self.assertEqual(settings["astra_api_tier"], "standard")
         self.assertEqual(settings["layout_mode"], "horizontal")
+
+    def test_astra_tier_setting_persists_and_invalid_values_default_to_standard(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "settings.json"
+            settings = overlay.load_settings(path)
+            settings["astra_api_tier"] = "ultrafast"
+            self.assertIsNone(overlay.save_settings(settings, path))
+            self.assertEqual(overlay.load_settings(path)["astra_api_tier"], "ultrafast")
+            path.write_text(json.dumps({"astra_api_tier": ["ultrafast"]}), encoding="utf-8")
+            self.assertEqual(overlay.load_settings(path)["astra_api_tier"], "standard")
 
     def test_invalid_layout_mode_defaults_to_horizontal(self):
         with tempfile.TemporaryDirectory() as temp_dir:

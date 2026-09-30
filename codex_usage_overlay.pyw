@@ -75,6 +75,10 @@ MODEL_LOG_ROWS_TO_SCAN = 250
 SQLITE_RATE_ROWS_TO_SCAN = 200
 API_PRICING_ASSUMPTION = "Standard API pricing assumed"
 API_PRICING_SOURCE_URL = "https://developers.openai.com/api/docs/pricing"
+API_ULTRAFAST_PRICING_ASSUMPTION = "Ultrafast API pricing selected as a scenario"
+API_ULTRAFAST_PRICING_SOURCE_URL = (
+    "https://developers.openai.com/api/docs/pricing?latest-pricing=ultrafast"
+)
 LONG_CONTEXT_INPUT_THRESHOLD_TOKENS = 272_000
 CACHE_WRITE_TELEMETRY_NOTE = (
     "Local Codex events do not report cache-write tokens; cache-write premiums are excluded."
@@ -180,6 +184,7 @@ class PricingResolution:
     pricing_model: str
     pricing: ModelPricing
     is_proxy: bool = False
+    tier: str = "standard"
 
 
 @dataclass(frozen=True)
@@ -195,6 +200,7 @@ class ApiCostEstimate:
     pricing: ModelPricing | None
     pricing_model: str | None
     pricing_is_proxy: bool
+    pricing_tier: str
     uncached_input_tokens: int
     cached_input_tokens: int
     output_tokens: int
@@ -267,8 +273,9 @@ class LogReadBatch:
     token_events: list[TokenEvent]
 
 
-# Official OpenAI Standard API prices, per 1M text tokens.
-# GPT-6 rates verified 2026-09-22; GPT-5.6 rates verified 2026-09-12.
+# Official OpenAI API prices, per 1M text tokens. The main table is Standard.
+# GPT-6.1 Sol and Astra Ultrafast rates verified 2026-09-30.
+# Other GPT-6 rates verified 2026-09-22; GPT-5.6 rates verified 2026-09-12.
 # GPT-5.6 Sol includes promotional pricing.
 # Source: https://developers.openai.com/api/docs/pricing
 API_MODEL_PRICING = {
@@ -287,6 +294,15 @@ API_MODEL_PRICING = {
         long_context_threshold_tokens=LONG_CONTEXT_INPUT_THRESHOLD_TOKENS,
         long_context_input_per_million=4.00,
         long_context_cached_input_per_million=0.40,
+        long_context_cache_write_per_million=5.00,
+        long_context_output_per_million=15.00,
+    ),
+    "gpt-6.1-sol": ModelPricing(
+        "gpt-6.1 Sol", 2.00, 0.10, 10.00, API_PRICING_SOURCE_URL,
+        cache_write_per_million=2.50,
+        long_context_threshold_tokens=LONG_CONTEXT_INPUT_THRESHOLD_TOKENS,
+        long_context_input_per_million=4.00,
+        long_context_cached_input_per_million=0.20,
         long_context_cache_write_per_million=5.00,
         long_context_output_per_million=15.00,
     ),
@@ -350,6 +366,15 @@ API_MODEL_PRICING = {
         "gpt-5.4 mini", 0.75, 0.075, 4.50, API_PRICING_SOURCE_URL
     ),
 }
+ASTRA_ULTRAFAST_PRICING = ModelPricing(
+    "gpt-6 Astra", 60.00, 6.00, 300.00, API_ULTRAFAST_PRICING_SOURCE_URL,
+    cache_write_per_million=75.00,
+    long_context_threshold_tokens=LONG_CONTEXT_INPUT_THRESHOLD_TOKENS,
+    long_context_input_per_million=120.00,
+    long_context_cached_input_per_million=12.00,
+    long_context_cache_write_per_million=150.00,
+    long_context_output_per_million=450.00,
+)
 API_PRICING_PROXY_MODELS = {
     "gpt-5.3-codex-spark": "gpt-5.5",
 }
@@ -553,6 +578,12 @@ def normalize_model_key(model: str | None) -> str | None:
     return normalized
 
 
+def normalize_astra_api_tier(value: Any) -> str:
+    if isinstance(value, str) and value in {"standard", "ultrafast"}:
+        return value
+    return "standard"
+
+
 def pricing_for_model(model: str | None) -> ModelPricing | None:
     key = normalize_model_key(model)
     if key is None:
@@ -560,10 +591,17 @@ def pricing_for_model(model: str | None) -> ModelPricing | None:
     return API_MODEL_PRICING.get(key)
 
 
-def resolve_model_pricing(model: str | None) -> PricingResolution | None:
+def resolve_model_pricing(
+    model: str | None, astra_api_tier: str = "standard"
+) -> PricingResolution | None:
     key = normalize_model_key(model)
     if key is None:
         return None
+
+    if key == "gpt-6-astra" and normalize_astra_api_tier(astra_api_tier) == "ultrafast":
+        return PricingResolution(
+            pricing_model=key, pricing=ASTRA_ULTRAFAST_PRICING, tier="ultrafast"
+        )
 
     exact_pricing = API_MODEL_PRICING.get(key)
     if exact_pricing is not None:
@@ -641,6 +679,7 @@ def estimate_api_cost(
     short_context_usage: TokenUsage | None = None,
     long_context_usage: TokenUsage | None = None,
     long_context_request_count: int = 0,
+    astra_api_tier: str = "standard",
 ) -> ApiCostEstimate:
     if short_context_usage is None and long_context_usage is None:
         short_context_usage = usage
@@ -665,7 +704,7 @@ def estimate_api_cost(
         - long_cached_tokens
     )
     output_tokens = short_context_usage.output_tokens + long_context_usage.output_tokens
-    pricing_resolution = resolve_model_pricing(detected_model.model)
+    pricing_resolution = resolve_model_pricing(detected_model.model, astra_api_tier)
     pricing = pricing_resolution.pricing if pricing_resolution else None
 
     warning = None
@@ -683,6 +722,7 @@ def estimate_api_cost(
             pricing=None,
             pricing_model=None,
             pricing_is_proxy=False,
+            pricing_tier="standard",
             uncached_input_tokens=uncached_input_tokens,
             cached_input_tokens=cached_input_tokens,
             output_tokens=output_tokens,
@@ -728,6 +768,7 @@ def estimate_api_cost(
         pricing=pricing,
         pricing_model=pricing_resolution.pricing_model,
         pricing_is_proxy=pricing_resolution.is_proxy,
+        pricing_tier=pricing_resolution.tier,
         uncached_input_tokens=uncached_input_tokens,
         cached_input_tokens=cached_input_tokens,
         output_tokens=output_tokens,
@@ -775,10 +816,14 @@ def format_api_cost_estimate(estimate: ApiCostEstimate) -> str:
         return "API est. unpriced" if estimate.model else "API est. --"
     if estimate.pricing_is_proxy:
         return f"{format_api_cost(estimate.total_cost)} API est. ({format_model_name(estimate.pricing_model)} proxy)"
+    if estimate.pricing_tier == "ultrafast":
+        return f"{format_api_cost(estimate.total_cost)} API est. (Ultrafast)"
     return f"{format_api_cost(estimate.total_cost)} API est."
 
 
-def model_pricing_to_dict(pricing: ModelPricing | None) -> dict[str, Any] | None:
+def model_pricing_to_dict(
+    pricing: ModelPricing | None, pricing_tier: str = "standard"
+) -> dict[str, Any] | None:
     if pricing is None:
         return None
     return {
@@ -793,7 +838,11 @@ def model_pricing_to_dict(pricing: ModelPricing | None) -> dict[str, Any] | None
         "long_context_cache_write_per_million": pricing.long_context_cache_write_per_million,
         "long_context_output_per_million": pricing.long_context_output_per_million,
         "source_url": pricing.source_url,
-        "assumption": API_PRICING_ASSUMPTION,
+        "assumption": (
+            API_ULTRAFAST_PRICING_ASSUMPTION
+            if pricing_tier == "ultrafast"
+            else API_PRICING_ASSUMPTION
+        ),
     }
 
 
@@ -803,9 +852,10 @@ def api_cost_estimate_to_dict(estimate: ApiCostEstimate | None) -> dict[str, Any
     return {
         "model": estimate.model,
         "model_source": estimate.model_source,
-        "pricing": model_pricing_to_dict(estimate.pricing),
+        "pricing": model_pricing_to_dict(estimate.pricing, estimate.pricing_tier),
         "pricing_model": estimate.pricing_model,
         "pricing_is_proxy": estimate.pricing_is_proxy,
+        "pricing_tier": estimate.pricing_tier,
         "uncached_input_tokens": estimate.uncached_input_tokens,
         "cached_input_tokens": estimate.cached_input_tokens,
         "output_tokens": estimate.output_tokens,
@@ -2147,6 +2197,7 @@ def load_settings(path: Path | None = None) -> dict[str, Any]:
         "show_resets": False,
         "show_token_counter": False,
         "show_api_cost_estimate": False,
+        "astra_api_tier": "standard",
     }
 
     try:
@@ -2169,6 +2220,7 @@ def load_settings(path: Path | None = None) -> dict[str, Any]:
     settings["show_resets"] = bool(settings.get("show_resets", False))
     settings["show_token_counter"] = bool(settings.get("show_token_counter", False))
     settings["show_api_cost_estimate"] = bool(settings.get("show_api_cost_estimate", False))
+    settings["astra_api_tier"] = normalize_astra_api_tier(settings.get("astra_api_tier"))
 
     position = settings.get("position")
     if not (
@@ -4087,6 +4139,7 @@ class OverlayApp:
             short_context_usage=self.token_counter.short_context_totals,
             long_context_usage=self.token_counter.long_context_totals,
             long_context_request_count=self.token_counter.long_context_request_count,
+            astra_api_tier=self.settings.get("astra_api_tier", "standard"),
         )
 
     def _render_model(
@@ -4484,6 +4537,7 @@ class OverlayApp:
         show_resets = bool(self.settings.get("show_resets", False))
         show_token_counter = bool(self.settings.get("show_token_counter", False))
         show_api_cost_estimate = bool(self.settings.get("show_api_cost_estimate", False))
+        astra_api_tier = normalize_astra_api_tier(self.settings.get("astra_api_tier"))
         current_layout = normalize_layout_mode(self.settings.get("layout_mode"))
 
         rows.append(MenuRow.disabled("Visibility"))
@@ -4539,6 +4593,18 @@ class OverlayApp:
                 lambda: self.run_menu_command(self.toggle_show_api_cost_estimate),
             )
         )
+        for label, tier in (
+            ("Astra API tier: Standard", "standard"),
+            ("Astra API tier: Ultrafast", "ultrafast"),
+        ):
+            rows.append(
+                MenuRow.command(
+                    selected_menu_label(label, astra_api_tier == tier),
+                    lambda selected=tier: self.run_menu_command(
+                        lambda: self.set_astra_api_tier(selected)
+                    ),
+                )
+            )
 
         rows.append(MenuRow.separator())
         rows.append(MenuRow.disabled("Layout"))
@@ -4654,7 +4720,12 @@ class OverlayApp:
             pricing_label = format_model_name(estimate.pricing_model)
             if estimate.pricing_is_proxy:
                 pricing_label += " proxy"
-            rows.append(MenuRow.disabled(f"Pricing model: {pricing_label}; tier: Standard (assumed)"))
+            tier_label = (
+                "Ultrafast (selected scenario)"
+                if estimate.pricing_tier == "ultrafast"
+                else "Standard (assumed)"
+            )
+            rows.append(MenuRow.disabled(f"Pricing model: {pricing_label}; tier: {tier_label}"))
         rows.append(
             MenuRow.disabled(
                 f"Tokens: input {format_token_count(estimate.uncached_input_tokens)}, "
@@ -4701,6 +4772,8 @@ class OverlayApp:
 
         if estimate.warning:
             rows.append(MenuRow.disabled(estimate.warning))
+        if estimate.pricing_tier == "ultrafast":
+            rows.append(MenuRow.disabled("Selected tier prices the whole counter window; Codex tier is not detected"))
         rows.append(MenuRow.disabled(CACHE_WRITE_TELEMETRY_NOTE))
         rows.append(MenuRow.disabled("API-equivalent estimate only; not actual Codex billing"))
 
@@ -4769,6 +4842,11 @@ class OverlayApp:
 
     def toggle_show_api_cost_estimate(self) -> None:
         self.set_show_api_cost_estimate(not bool(self.settings.get("show_api_cost_estimate", False)))
+
+    def set_astra_api_tier(self, tier: str) -> None:
+        self.settings["astra_api_tier"] = normalize_astra_api_tier(tier)
+        self.save_settings()
+        self.request_render()
 
     def set_layout_mode(self, mode: str) -> None:
         self.settings["layout_mode"] = normalize_layout_mode(mode)
