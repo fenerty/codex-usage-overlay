@@ -3364,7 +3364,7 @@ class RenderAndVisibilityGatingTests(unittest.TestCase):
         self.assertTrue(first_label.destroyed)
         self.assertEqual(len(self.FakeLabel.instances), 2)
 
-    def test_visibility_calls_tk_only_on_transitions(self):
+    def test_visibility_calls_tk_only_on_transitions_or_explicit_force(self):
         app = object.__new__(overlay.OverlayApp)
         app.root = FakeSchedulerRoot()
         app.settings = {"visibility_mode": "visible_window"}
@@ -3390,7 +3390,7 @@ class RenderAndVisibilityGatingTests(unittest.TestCase):
         self.assertEqual(app.root.withdraw_calls, 1)
         self.assertEqual(
             app.root.attribute_calls.count(("-topmost", True)),
-            1,
+            2,
         )
 
 

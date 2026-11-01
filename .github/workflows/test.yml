@@ -18,7 +18,7 @@ jobs:
           python-version: "3.12"
 
       - name: Run unit tests
-        run: python -m unittest -v test_codex_usage_overlay.py
+        run: python -m unittest -v test_codex_usage_overlay.py test_window_recovery.py
 
       - name: Compile check
-        run: python -m py_compile codex_usage_overlay.pyw test_codex_usage_overlay.py
+        run: python -m py_compile codex_usage_overlay.pyw test_codex_usage_overlay.py test_window_recovery.py
