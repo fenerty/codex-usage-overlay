@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Recover incorrect window ordering even when Windows still marks the overlay
+  topmost. Confirm a stable foreground pair before a non-activating repair;
+  respect menu/drag leases, other topmost windows, and a retry cooldown.
+- Verify the actual native topmost state instead of trusting a cached request.
+- Add bounded local window-state diagnostics and repair-result logging, without
+  window titles, transcript contents, or usage data.
+
 - Add exact GPT-6.1 Sol Standard API rates while keeping GPT-6 Sol distinct.
 - Add a saved Astra Standard/Ultrafast API estimate choice. Show the effective
   tier in the overlay, Details, and runtime state; Ultrafast is a selected

@@ -252,13 +252,42 @@ Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*codex_usag
 Only one instance should be running. New launches exit cleanly if another
 overlay instance is already active.
 
+### Overlay remains behind another window
+
+Version `0.1.14` checks the actual Windows topmost state every five seconds
+while the overlay is shown. It also checks relative window ordering: two
+matching observations below the same non-topmost foreground window trigger a
+repair, even if the overlay's topmost flag remains set. The window identities
+are checked again immediately before repair. Unknown ordering is not treated
+as a failure, and an already healthy window is left alone.
+
+Repairs do not activate, move, resize, or hide/show the overlay. Menu and drag
+interactions defer recovery, other topmost foreground windows are respected,
+and ordering repair attempts have a 30-second cooldown. A successful native
+call is recorded as recovered only if the resulting ordering is verified.
+
+Lightweight diagnostics are stored locally on Windows at:
+
+```text
+%LOCALAPPDATA%\CodexUsageOverlay\logs\window-events.jsonl
+```
+
+The current file and two rotated backups are each limited to 256 KiB
+(768 KiB total). Records include timestamps, visibility transitions, native
+window state, foreground process/window identifiers, and repair results.
+Unchanged state is recorded at most once a minute; repeated identical errors
+are coalesced for a minute. Titles, executable/document paths, transcript
+contents, and usage data are excluded. Logging failures do not stop the overlay.
+If it disappears again, note the approximate time before minimizing/restoring
+the host so the before/after records can be compared.
+
 ## Development
 
 Run the tests:
 
 ```powershell
-python -m unittest -v test_codex_usage_overlay.py
-python -m py_compile codex_usage_overlay.pyw test_codex_usage_overlay.py
+python -m unittest -v test_codex_usage_overlay.py test_window_recovery.py
+python -m py_compile codex_usage_overlay.pyw test_codex_usage_overlay.py test_window_recovery.py
 ```
 
 The project intentionally uses only the Python standard library.

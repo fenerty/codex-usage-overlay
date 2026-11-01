@@ -29,7 +29,7 @@ from typing import Any, Callable
 
 
 APP_NAME = "Codex Usage Overlay"
-APP_VERSION = "0.1.13"
+APP_VERSION = "0.1.14"
 SETTINGS_FILE_NAME = "codex_usage_overlay.settings.json"
 RUNTIME_STATE_FILE_NAME = "codex-usage-overlay-state.json"
 INSTANCE_LOCK_FILE_NAME = "codex-usage-overlay.lock"
@@ -55,6 +55,11 @@ HIDDEN_POLL_INTERVAL_MS = 1_000
 HIDDEN_LOG_POLL_INTERVAL_SECONDS = 5
 PROCESS_VISIBILITY_POLL_INTERVAL_SECONDS = 1
 RUNTIME_STATE_WRITE_INTERVAL_SECONDS = 2
+WINDOW_STATE_POLL_SECONDS = 5
+WINDOW_STATE_LOG_SECONDS = 60
+WINDOW_ORDER_REPAIR_COOLDOWN_SECONDS = 30
+WINDOW_LOG_MAX_BYTES = 262_144
+WINDOW_LOG_BACKUPS = 2
 SESSION_FULL_RESCAN_INTERVAL_SECONDS = 30
 SQLITE_FALLBACK_PROBE_INTERVAL_SECONDS = 5
 DISPLAY_TOPOLOGY_POLL_INTERVAL_SECONDS = 5
@@ -1987,6 +1992,247 @@ def windows_monitor_work_area(position: list[int] | tuple[int, int]) -> tuple[in
         return None
 
 
+class WindowEventLog:
+    """Bounded local UI diagnostics; never include usage, titles or paths."""
+
+    STATE_KEYS = (
+        "hwnd", "native_visible", "iconic", "topmost", "cloaked", "rect",
+        "foreground_hwnd", "foreground_pid", "foreground_topmost",
+        "above_foreground",
+    )
+
+    def __init__(self, path: Path | None = None, max_bytes: int = WINDOW_LOG_MAX_BYTES,
+                 backups: int = WINDOW_LOG_BACKUPS) -> None:
+        local = Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir())
+        if max_bytes <= 0 or backups < 1:
+            raise ValueError("Window log limits must be positive")
+        self.path = path or local / "CodexUsageOverlay" / "logs" / "window-events.jsonl"
+        self.max_bytes = max_bytes
+        self.backups = backups
+        self.last_error: str | None = None
+        self._last_error_key: tuple[Any, ...] | None = None
+        self._last_error_at = 0.0
+
+    def write(self, event: str, *, reason: str | None = None,
+              state: dict[str, Any] | None = None, error: BaseException | None = None,
+              shown: bool | None = None, mode: str | None = None) -> bool:
+        record: dict[str, Any] = {
+            "utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "pid": os.getpid(), "build": APP_VERSION, "event": event,
+        }
+        if reason is not None:
+            record["reason"] = reason
+        if state is not None:
+            record["native"] = {key: state[key] for key in self.STATE_KEYS if key in state}
+        if shown is not None:
+            record["shown"] = bool(shown)
+        if mode in VALID_VISIBILITY_MODES:
+            record["mode"] = mode
+        if error is not None:
+            details = {"type": type(error).__name__}
+            for key in ("winerror", "errno"):
+                value = getattr(error, key, None)
+                if isinstance(value, int):
+                    details[key] = value
+            record["error"] = details
+            error_key = (event, reason, tuple(sorted(details.items())))
+            now = time.monotonic()
+            if error_key == self._last_error_key and now - self._last_error_at < 60:
+                return False
+            self._last_error_key, self._last_error_at = error_key, now
+        try:
+            line = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
+            if len(line) > self.max_bytes:
+                self.last_error = "RecordTooLarge"
+                return False
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if self.path.exists() and self.path.stat().st_size + len(line) > self.max_bytes:
+                for index in range(self.backups, 0, -1):
+                    source = self.path if index == 1 else self.path.with_name(
+                        f"{self.path.name}.{index - 1}"
+                    )
+                    if source.exists():
+                        source.replace(self.path.with_name(f"{self.path.name}.{index}"))
+            with self.path.open("ab") as handle:
+                handle.write(line)
+            self.last_error = None
+            return True
+        except OSError as exc:
+            self.last_error = type(exc).__name__
+            return False
+
+
+def window_order_repair_key(state: dict[str, Any] | None) -> tuple[int, int, int] | None:
+    """Only positively observed ordering below an ordinary foreground is eligible."""
+    if not state or not (
+        state.get("native_visible") is True and state.get("iconic") is False
+        and state.get("cloaked") == 0 and state.get("topmost") is True
+        and state.get("above_foreground") is False
+        and state.get("foreground_topmost") is False
+    ):
+        return None
+    own = int(state.get("hwnd") or 0)
+    foreground = int(state.get("foreground_hwnd") or 0)
+    pid = int(state.get("foreground_pid") or 0)
+    if not own or not foreground or foreground == own or not pid or pid == os.getpid():
+        return None
+    return own, foreground, pid
+
+
+class WindowOrderChanged(OSError):
+    """A sampled foreground/overlay pair changed before a proposed repair."""
+
+
+class WindowsOverlayWindow:
+    """Read the actual Tk wrapper and repair topmost without activating it."""
+
+    TOPMOST_FLAGS = 0x0001 | 0x0002 | 0x0010 | 0x0200
+
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.user32: Any = None
+        self.dwmapi: Any = None
+        if platform.system() != "Windows":
+            return
+        self.user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentThreadId.argtypes = []
+        kernel32.GetCurrentThreadId.restype = ctypes.wintypes.DWORD
+        self.current_thread_id = kernel32.GetCurrentThreadId
+        self.user32.GetAncestor.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.UINT]
+        self.user32.GetAncestor.restype = ctypes.wintypes.HWND
+        for name in ("IsWindow", "IsWindowVisible", "IsIconic"):
+            function = getattr(self.user32, name)
+            function.argtypes = [ctypes.wintypes.HWND]
+            function.restype = ctypes.wintypes.BOOL
+        self.user32.GetWindowThreadProcessId.argtypes = [
+            ctypes.wintypes.HWND, ctypes.POINTER(ctypes.wintypes.DWORD)
+        ]
+        self.user32.GetWindowThreadProcessId.restype = ctypes.wintypes.DWORD
+        self.user32.GetWindowRect.argtypes = [ctypes.wintypes.HWND, ctypes.POINTER(ctypes.wintypes.RECT)]
+        self.user32.GetWindowRect.restype = ctypes.wintypes.BOOL
+        self.user32.GetForegroundWindow.argtypes = []
+        self.user32.GetForegroundWindow.restype = ctypes.wintypes.HWND
+        self.user32.GetWindow.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.UINT]
+        self.user32.GetWindow.restype = ctypes.wintypes.HWND
+        self.get_style = getattr(self.user32, "GetWindowLongPtrW", None) or self.user32.GetWindowLongW
+        self.get_style.argtypes = [ctypes.wintypes.HWND, ctypes.c_int]
+        self.get_style.restype = ctypes.c_ssize_t
+        self.user32.SetWindowPos.argtypes = [
+            ctypes.wintypes.HWND, ctypes.wintypes.HWND,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.wintypes.UINT,
+        ]
+        self.user32.SetWindowPos.restype = ctypes.wintypes.BOOL
+        try:
+            self.dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+            self.dwmapi.DwmGetWindowAttribute.argtypes = [
+                ctypes.wintypes.HWND, ctypes.wintypes.DWORD, ctypes.c_void_p, ctypes.wintypes.DWORD,
+            ]
+            self.dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+        except OSError:
+            pass
+
+    def _style(self, hwnd: int) -> int:
+        ctypes.set_last_error(0)
+        style = int(self.get_style(hwnd, -20))
+        if style == 0 and ctypes.get_last_error():
+            raise ctypes.WinError(ctypes.get_last_error())
+        return style
+
+    def _hwnd(self) -> int:
+        raw = str(self.root.tk.call("wm", "frame", self.root._w)).strip()
+        child = int(raw, 16) if raw.lower().startswith("0x") else int(raw)
+        hwnd = int(self.user32.GetAncestor(child, 2) or child)
+        pid = ctypes.wintypes.DWORD()
+        if not self.user32.IsWindow(hwnd):
+            raise OSError("Overlay window is not mapped")
+        owner_thread = self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value != os.getpid():
+            raise OSError("Overlay window ownership mismatch")
+        current_thread_id = getattr(self, "current_thread_id", None)
+        if current_thread_id is not None and int(owner_thread) != int(current_thread_id()):
+            raise OSError("Overlay window thread mismatch")
+        return hwnd
+
+    def _find_above(self, reference: int, target: int) -> bool:
+        current = reference
+        seen = {current}
+        for _ in range(128):
+            current = int(self.user32.GetWindow(current, 3) or 0)  # GW_HWNDPREV
+            if not current or current in seen or not self.user32.IsWindow(current):
+                return False  # Not found is never itself evidence of "below".
+            if current == target:
+                return True
+            seen.add(current)
+        return False
+
+    def _relative_order(self, hwnd: int, foreground: int) -> bool | None:
+        if not foreground:
+            return None
+        if hwnd == foreground:
+            return True
+        if self._find_above(foreground, hwnd):
+            return True
+        if self._find_above(hwnd, foreground):
+            return False
+        return None
+
+    def snapshot(self) -> dict[str, Any] | None:
+        if self.user32 is None:
+            return None
+        hwnd = self._hwnd()
+        rect = ctypes.wintypes.RECT()
+        if not self.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        foreground = int(self.user32.GetForegroundWindow() or 0)
+        foreground_pid = ctypes.wintypes.DWORD()
+        self.user32.GetWindowThreadProcessId(foreground, ctypes.byref(foreground_pid))
+        above_foreground = self._relative_order(hwnd, foreground)
+        cloaked: int | None = None
+        if self.dwmapi is not None:
+            value = ctypes.wintypes.DWORD()
+            if self.dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(value), ctypes.sizeof(value)) == 0:
+                cloaked = value.value
+        foreground_topmost = None
+        if foreground:
+            try:
+                foreground_topmost = bool(self._style(foreground) & 8)
+            except OSError:
+                pass  # The foreground window can disappear during this sample.
+        current_foreground = int(self.user32.GetForegroundWindow() or 0)
+        current_pid = ctypes.wintypes.DWORD()
+        self.user32.GetWindowThreadProcessId(current_foreground, ctypes.byref(current_pid))
+        if (current_foreground != foreground or current_pid.value != foreground_pid.value
+                or self._hwnd() != hwnd or not self.user32.IsWindow(foreground)):
+            above_foreground = None
+        return {
+            "hwnd": hwnd, "native_visible": bool(self.user32.IsWindowVisible(hwnd)),
+            "iconic": bool(self.user32.IsIconic(hwnd)), "topmost": bool(self._style(hwnd) & 8),
+            "cloaked": cloaked, "rect": [rect.left, rect.top, rect.right, rect.bottom],
+            "foreground_hwnd": foreground, "foreground_pid": foreground_pid.value,
+            "foreground_topmost": foreground_topmost,
+            "above_foreground": above_foreground,
+        }
+
+    def ensure_topmost(self, expected_order: tuple[int, int, int] | None = None) -> dict[str, Any] | None:
+        if self.user32 is None:
+            return None
+        if expected_order is not None and window_order_repair_key(self.snapshot()) != expected_order:
+            raise WindowOrderChanged("Window order changed before repair")
+        hwnd = self._hwnd()  # Re-resolve and validate after every possible Tk remap.
+        if expected_order is not None and (
+            hwnd != expected_order[0]
+            or int(self.user32.GetForegroundWindow() or 0) != expected_order[1]
+        ):
+            raise WindowOrderChanged("Window identity changed before repair")
+        if not self.user32.SetWindowPos(hwnd, ctypes.wintypes.HWND(-1), 0, 0, 0, 0, self.TOPMOST_FLAGS):
+            raise ctypes.WinError(ctypes.get_last_error())
+        state = self.snapshot()
+        if state is None or not state["topmost"]:
+            raise OSError("Overlay topmost verification failed")
+        return state
+
+
 class WindowsDisplayChangeObserver:
     """Best-effort observer; native callbacks only record display hints."""
 
@@ -3404,6 +3650,17 @@ class OverlayApp:
         self._native_display_observer_error: str | None = None
         self._last_ui_error: str | None = None
         self._last_settings_error: str | None = None
+        self._window_log = WindowEventLog()
+        self._native_window: WindowsOverlayWindow | None = None
+        self._last_native_window_state: dict[str, Any] | None = None
+        self._last_window_sample_at: str | None = None
+        self._last_topmost_error: str | None = None
+        self._next_window_check_at = 0.0
+        self._next_window_log_at = 0.0
+        self._pending_window_order: tuple[int, int, int] | None = None
+        self._pending_window_order_at = 0.0
+        self._next_window_order_repair_at = 0.0
+        self._last_window_order_result: str | None = None
         self._quitting = False
 
         self.root = tk.Tk()
@@ -3414,6 +3671,12 @@ class OverlayApp:
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self._topmost_enabled = True
+        try:
+            self._native_window = WindowsOverlayWindow(self.root)
+        except (OSError, AttributeError, TypeError) as exc:
+            self._log_window_event("window_api_error", reason="initialize", error=exc)
+        self._log_window_event("start", reason="initialize")
+        self.root.bind("<Map>", self._on_overlay_map, add="+")
         try:
             self.root.attributes("-alpha", self.settings["opacity"])
         except tk.TclError:
@@ -3453,6 +3716,11 @@ class OverlayApp:
         widget.bind("<ButtonRelease-1>", self.end_drag)
         widget.bind("<ButtonRelease-3>", self.show_menu)
         widget.bind("<ButtonRelease-2>", self.show_menu)
+
+    def _on_overlay_map(self, event: tk.Event) -> None:
+        if getattr(event, "widget", None) is self.root:
+            self._next_window_check_at = 0.0
+            self._log_window_event("mapped", reason="map")
 
     def _position_window(self) -> None:
         self.reconcile_overlay_position(
@@ -3609,6 +3877,7 @@ class OverlayApp:
                 callback_error = None
             if callback_error is not None:
                 self._native_display_observer_error = repr(callback_error)
+                self._log_window_event("display_observer_error", reason="callback", error=callback_error)
         pending = observer.take_pending() if observer is not None else set()
         if not pending:
             return False
@@ -3966,6 +4235,12 @@ class OverlayApp:
             "last_ui_error": getattr(self, "_last_ui_error", None),
             "last_settings_error": getattr(self, "_last_settings_error", None),
             "installed_host_build": getattr(self, "_installed_host_build", None),
+            "app_version": APP_VERSION,
+            "native_window": getattr(self, "_last_native_window_state", None),
+            "native_sample_at": getattr(self, "_last_window_sample_at", None),
+            "last_topmost_error": getattr(self, "_last_topmost_error", None),
+            "last_window_order_result": getattr(self, "_last_window_order_result", None),
+            "window_log_error": getattr(getattr(self, "_window_log", None), "last_error", None),
         }
 
     def _report_tk_callback_exception(
@@ -3977,6 +4252,7 @@ class OverlayApp:
         if not isinstance(exception_value, exception_type):
             exception_value = exception_type(str(exception_value))
         self._last_ui_error = diagnostic_error_text(exception_value)
+        self._log_window_event("ui_error", reason="callback", error=exception_value)
         if getattr(self, "_quitting", False):
             return
         try:
@@ -4112,9 +4388,11 @@ class OverlayApp:
             )
         if apply_visibility:
             self.update_visibility(
+                force=force,
                 should_show=should_show,
                 monitors=pre_show_monitors,
             )
+            self._check_window_state_if_due(now, force=force)
         if force or data_changed or now >= getattr(self, "_next_state_write_at", 0.0):
             self._write_runtime_state(now)
         if schedule_next:
@@ -4306,15 +4584,127 @@ class OverlayApp:
             return None
         return self.snapshot.primary if key == "primary" else self.snapshot.secondary
 
-    def _set_topmost(self, enabled: bool) -> None:
-        requested = bool(enabled)
-        if getattr(self, "_topmost_enabled", None) == requested:
+    def _log_window_event(self, event: str, **details: Any) -> None:
+        logger = getattr(self, "_window_log", None)
+        if logger is None:
             return
         try:
-            self.root.attributes("-topmost", requested)
-        except (AttributeError, tk.TclError):
+            logger.write(
+                event, shown=getattr(self, "_overlay_is_shown", False),
+                mode=getattr(self, "settings", {}).get("visibility_mode"), **details,
+            )
+        except Exception:
+            # Diagnostic storage must never interrupt rendering or visibility.
+            pass
+
+    def _record_window_state(self, state: dict[str, Any], now: float, reason: str) -> None:
+        previous = getattr(self, "_last_native_window_state", None)
+        self._last_native_window_state = dict(state)
+        self._last_window_sample_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        if state != previous or now >= getattr(self, "_next_window_log_at", 0.0):
+            self._log_window_event("window_state", reason=reason, state=state)
+            self._next_window_log_at = now + WINDOW_STATE_LOG_SECONDS
+
+    def _check_window_state_if_due(self, now: float, force: bool = False) -> None:
+        if (getattr(self, "_quitting", False)
+                or not getattr(self, "_overlay_is_shown", False)
+                or self._visibility_interaction_active()):
+            self._pending_window_order = None
             return
-        self._topmost_enabled = requested
+        if not force and now < getattr(self, "_next_window_check_at", 0.0):
+            return
+        self._next_window_check_at = now + WINDOW_STATE_POLL_SECONDS
+        native = getattr(self, "_native_window", None)
+        if native is None:
+            self._pending_window_order = None
+            return
+        try:
+            state = native.snapshot()
+            if state is None:
+                self._pending_window_order = None
+                return
+            self._record_window_state(state, now, "poll")
+            if state["native_visible"] and not state["iconic"] and not state["cloaked"] and not state["topmost"]:
+                self._pending_window_order = None
+                self._set_topmost(True, reason="native_repair")
+                return
+            key = window_order_repair_key(state)
+            if key is None or now < getattr(self, "_next_window_order_repair_at", 0.0):
+                self._pending_window_order = None
+            elif key != getattr(self, "_pending_window_order", None):
+                self._pending_window_order = key
+                self._pending_window_order_at = now
+                self._log_window_event("window_order_suspect", reason="poll", state=state)
+            elif now - self._pending_window_order_at >= WINDOW_STATE_POLL_SECONDS:
+                self._pending_window_order = None
+                self._next_window_order_repair_at = now + WINDOW_ORDER_REPAIR_COOLDOWN_SECONDS
+                self._set_topmost(True, reason="ordering_repair", expected_order=key)
+        except (OSError, AttributeError, TypeError, ValueError, tk.TclError) as exc:
+            self._pending_window_order = None
+            self._last_topmost_error = type(exc).__name__
+            self._log_window_event("window_query_error", reason="poll", error=exc)
+
+    def _set_topmost(self, enabled: bool, force: bool = False, reason: str = "visibility",
+                     expected_order: tuple[int, int, int] | None = None) -> None:
+        requested = bool(enabled)
+        if getattr(self, "_quitting", False) or self._visibility_interaction_active():
+            return
+        try:
+            if expected_order is not None:
+                native = getattr(self, "_native_window", None)
+                if not requested or native is None or not self.root.winfo_ismapped():
+                    return
+                state = native.snapshot()
+                if window_order_repair_key(state) != expected_order:
+                    self._last_window_order_result = "cancelled"
+                    self._log_window_event("window_order_cancelled", reason=reason, state=state)
+                    return
+                self._log_window_event("window_order_repair", reason=reason, state=state)
+                state = native.ensure_topmost(expected_order=expected_order)
+                if state is not None:
+                    self._record_window_state(state, time.monotonic(), "ordering_result")
+                restored = bool(state is not None and state.get("topmost") is True
+                    and state.get("above_foreground") is True
+                    and (state.get("hwnd"), state.get("foreground_hwnd"), state.get("foreground_pid")) == expected_order)
+                self._log_window_event(
+                    "window_order_restored" if restored else "window_order_unresolved",
+                    reason=reason, state=state,
+                )
+                self._last_window_order_result = "restored" if restored else "unresolved"
+                self._last_topmost_error = None
+                return
+            # The cached request is not evidence of the native window's state.
+            if force or getattr(self, "_topmost_enabled", None) != requested:
+                self.root.attributes("-topmost", requested)
+                self._topmost_enabled = requested
+            native = getattr(self, "_native_window", None)
+            if requested and native is not None and self.root.winfo_ismapped():
+                state = native.snapshot()
+                if state is not None:
+                    self._record_window_state(state, time.monotonic(), reason)
+                    if force or not state["topmost"]:
+                        repairing = not state["topmost"]
+                        self._log_window_event(
+                            "topmost_repair" if repairing else "topmost_reapply",
+                            reason=reason, state=state,
+                        )
+                        state = native.ensure_topmost()
+                        if state is not None:
+                            self._record_window_state(state, time.monotonic(), "repaired")
+                        self._log_window_event(
+                            "topmost_restored" if repairing else "topmost_verified",
+                            reason=reason, state=state,
+                        )
+                        self._topmost_enabled = True
+            self._last_topmost_error = None
+        except WindowOrderChanged:
+            self._last_window_order_result = "cancelled"
+            self._log_window_event("window_order_cancelled", reason=reason)
+        except (AttributeError, OSError, TypeError, ValueError, tk.TclError) as exc:
+            if expected_order is not None:
+                self._last_window_order_result = "error"
+            self._last_topmost_error = type(exc).__name__
+            self._log_window_event("topmost_error", reason=reason, error=exc)
 
     def update_visibility(
         self,
@@ -4354,13 +4744,16 @@ class OverlayApp:
                 )
                 self.root.deiconify()
                 self._overlay_is_shown = True
-                self._set_topmost(True)
+                self._set_topmost(True, force=True, reason="show")
+                self._log_window_event("shown", reason="visibility")
             elif force:
-                self._set_topmost(True)
+                self._set_topmost(True, force=True, reason="force")
         else:
             if was_shown:
                 self.root.withdraw()
             self._overlay_is_shown = False
+            if was_shown:
+                self._log_window_event("hidden", reason="visibility")
 
     def show_menu(self, event: tk.Event) -> None:
         if self.is_dragging or getattr(self, "_quitting", False):
@@ -4873,6 +5266,9 @@ class OverlayApp:
     def save_settings(self) -> None:
         previous_error = getattr(self, "_last_settings_error", None)
         self._last_settings_error = save_settings(self.settings, self.settings_path)
+        if self._last_settings_error is not None:
+            # Existing state retains the detailed message; persistent UI logs do not.
+            self._log_window_event("settings_error", reason="save", error=OSError())
         if self._last_settings_error is not None or previous_error is not None:
             try:
                 self._write_runtime_state()
@@ -4882,6 +5278,7 @@ class OverlayApp:
     def quit(self) -> None:
         if self._quitting:
             return
+        self._log_window_event("stop", reason="quit")
         self._quitting = True
         self._cancel_post_menu_visibility_reconcile()
         self._cancel_post_drag_visibility_reconcile()
